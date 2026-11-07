@@ -233,7 +233,7 @@ def main():
     print(f"[MODEL] Loading base model {args.base_model}...")
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
 
@@ -261,7 +261,7 @@ def main():
         gradient_accumulation_steps=args.grad_accum_steps,
         learning_rate=1e-4,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.05,
+        warmup_steps=10,
         weight_decay=0.01,
         bf16=True,
         logging_steps=10,

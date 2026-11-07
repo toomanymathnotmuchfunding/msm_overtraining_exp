@@ -117,7 +117,7 @@ def evaluate_checkpoint(
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        base_model_name, torch_dtype=torch.bfloat16, device_map="auto"
+        base_model_name, dtype=torch.bfloat16, device_map="auto"
     )
     if msm_dir != "none":
         model = PeftModel.from_pretrained(model, msm_dir).merge_and_unload()
