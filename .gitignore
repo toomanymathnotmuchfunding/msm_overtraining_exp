@@ -1,0 +1,17 @@
+# Python & PyTorch artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Experiment outputs & checkpoints
+checkpoints/
+data/
+logs/
+results/
+*.done
+training_complete
+*.zip
+
+# Submodules / cloned repos
+model_spec_midtraining/
