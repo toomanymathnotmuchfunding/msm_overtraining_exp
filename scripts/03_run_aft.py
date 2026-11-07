@@ -112,28 +112,32 @@ class EtaWeightedTrainer(Trainer):
     """
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         sample_weight = inputs.pop("sample_weight", None)
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits
+        labels = inputs.get("labels")
 
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+
+        # Shift tokens for next-token prediction
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
         token_losses = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1)
         ).view(shift_labels.size())
 
         valid_mask = (shift_labels != -100).to(token_losses.dtype)
-        if sample_weight is not None:
-            w = sample_weight.unsqueeze(-1).to(token_losses.dtype)
-            weighted_token_losses = token_losses * valid_mask * w
-        else:
-            weighted_token_losses = token_losses * valid_mask
 
-        denom = valid_mask.sum().clamp(min=1.0)
-        loss = weighted_token_losses.sum() / denom
+        if sample_weight is not None:
+            # Per-sample weighting: compute average loss per valid token, then weight by sample_weight
+            per_token_valid = valid_mask.sum(dim=-1).clamp(min=1.0)
+            per_sample_loss = (token_losses * valid_mask).sum(dim=-1) / per_token_valid
+            w = sample_weight.to(per_sample_loss.dtype)
+            loss = (per_sample_loss * w).sum() / w.sum().clamp(min=1e-8)
+        else:
+            loss = (token_losses * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+
         return (loss, outputs) if return_outputs else loss
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -230,19 +234,21 @@ def main():
 
     train_ds = WeightedSFTDataset(combined_records, tokenizer, max_seq_length=args.max_seq_length)
 
-    print(f"[MODEL] Loading base model {args.base_model}...")
+    # Load base model
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         dtype=torch.bfloat16,
-        attn_implementation="sdpa",
     )
 
+    # If MSM checkpoint provided, merge it into base weights
     if args.msm_adapter_dir and args.msm_adapter_dir.lower() != "none":
-        print(f"[MSM] Merging MSM adapter from {args.msm_adapter_dir} into base weights before AFT...")
         peft_msm = PeftModel.from_pretrained(model, args.msm_adapter_dir)
         model = peft_msm.merge_and_unload()
+        del peft_msm
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    model.enable_input_require_grads()
     lora_config = LoraConfig(
         r=64,
         lora_alpha=128,
@@ -252,26 +258,34 @@ def main():
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
+    model.enable_input_require_grads()
     model.print_trainable_parameters()
+
+    # Micro batch size & gradient accumulation
+    per_device_batch_size = args.per_device_batch_size
+    grad_accum_steps = args.grad_accum_steps
+    epochs = 1
+
+    # Exact total optimization steps & 5% warmup
+    effective_batch_size = per_device_batch_size * grad_accum_steps
+    total_steps = (len(train_ds) // effective_batch_size) * epochs
+    warmup_steps = max(1, int(0.05 * total_steps))
 
     training_args = TrainingArguments(
         output_dir=str(out_dir),
-        num_train_epochs=1.0,
-        per_device_train_batch_size=args.per_device_batch_size,
-        gradient_accumulation_steps=args.grad_accum_steps,
-        learning_rate=1e-4,
-        lr_scheduler_type="cosine",
-        warmup_steps=10,
-        weight_decay=0.01,
-        bf16=True,
+        per_device_train_batch_size=per_device_batch_size,
+        gradient_accumulation_steps=grad_accum_steps,
+        learning_rate=2e-5,
+        num_train_epochs=epochs,
+        warmup_steps=warmup_steps,
         logging_steps=10,
         save_strategy="steps",
         save_steps=args.save_steps,
         save_total_limit=2,
-        seed=args.seed,
+        bf16=True,
         gradient_checkpointing=True,
-        remove_unused_columns=False,
         report_to="none",
+        seed=args.seed,
     )
 
     last_ckpt = get_last_checkpoint(str(out_dir))

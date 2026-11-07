@@ -96,7 +96,6 @@ def main():
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
-    model.enable_input_require_grads()
 
     lora_config = LoraConfig(
         r=64,
@@ -107,25 +106,34 @@ def main():
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
+    model.enable_input_require_grads()
     model.print_trainable_parameters()
+
+    # Micro batch size & gradient accumulation
+    per_device_batch_size = args.per_device_batch_size
+    grad_accum_steps = args.grad_accum_steps
+    epochs = 1
+
+    # Exact total optimization steps & 5% warmup
+    effective_batch_size = per_device_batch_size * grad_accum_steps
+    total_steps = (len(tokenized_ds) // effective_batch_size) * epochs
+    warmup_steps = max(1, int(0.05 * total_steps))
 
     training_args = TrainingArguments(
         output_dir=str(out_dir),
-        num_train_epochs=1.0,
-        per_device_train_batch_size=args.per_device_batch_size,
-        gradient_accumulation_steps=args.grad_accum_steps,
+        per_device_train_batch_size=per_device_batch_size,
+        gradient_accumulation_steps=grad_accum_steps,
         learning_rate=1e-4,
-        lr_scheduler_type="cosine",
-        warmup_steps=10,
-        weight_decay=0.01,
-        bf16=True,
+        num_train_epochs=epochs,
+        warmup_steps=warmup_steps,
         logging_steps=10,
         save_strategy="steps",
         save_steps=args.save_steps,
         save_total_limit=2,
-        seed=args.seed,
+        bf16=True,
         gradient_checkpointing=True,
         report_to="none",
+        seed=args.seed,
     )
 
     last_ckpt = get_last_checkpoint(str(out_dir))
