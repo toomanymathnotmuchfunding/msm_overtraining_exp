@@ -1,187 +1,137 @@
-#!/bin/bash
-#SBATCH --job-name=msm_2x2_master
-#SBATCH --partition=sched_mit_hill
-#SBATCH --time=00:30:00
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=8G
-#SBATCH --output=logs/master_%j.out
-#SBATCH --error=logs/master_%j.err
+#!/usr/bin/env bash
+#SBATCH --job-name=msm_2x2
+#SBATCH --partition=mit_normal_gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --gres=gpu:1
+#SBATCH --time=05:55:00
+#SBATCH --output=logs/msm_2x2_%j.out
+#SBATCH --error=logs/msm_2x2_%j.err
 
-# ==============================================================================
-# Master Orchestrator for MIT Engaging Cluster
-# Submits the full 2x2 pipeline with Slurm `--dependency=afterok` chains:
-#   Stage 1: Download & verify Hugging Face datasets + build 2M-token IT mix
-#   Stage 2: MSM Midtraining (Pro-Affordability & Pro-America specs x seeds)
-#   Stage 3: 2x2 AFT Grid: {No MSM, MSM} x {Standard AFT (eta=1), Over-Training AFT (eta=ETA_OVERTRAIN)}
-#   Stage 4: OOD Evaluation + Clustered Interaction Regressions
-#
-# All jobs checkpoint every 100 steps and write a `training_complete` marker,
-# so re-running `sbatch submit_all.sbatch` safely skips finished stages and
-# resumes interrupted runs from the latest checkpoint.
-# ==============================================================================
+set -e
 
-set -euo pipefail
-mkdir -p logs checkpoints results data
+echo "============================================================"
+echo " Job ID:     $SLURM_JOB_ID"
+echo " Node:       $SLURMD_NODENAME"
+echo " Started at: $(date)"
+echo "============================================================"
 
-# Cluster partition / GPU configuration (override via environment if needed)
-GPU_PARTITION="${GPU_PARTITION:-ou_bcs_normal}"
-GPU_GRES="${GPU_GRES:-gpu:h100:1}"
-BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B}"
-ETA_OVERTRAIN="${ETA_OVERTRAIN:-4.0}"
-WEIGHTING_MODE="${WEIGHTING_MODE:-loss_weight}"
-SEEDS=(0 1 2 3)
-SPECS=("pro_affordability" "pro_america")
+PROJECT_DIR="$SLURM_SUBMIT_DIR"
+cd "$PROJECT_DIR"
+mkdir -p logs checkpoints data results
 
-echo "[1/4] Submitting Data Download & Preparation Job..."
-DATA_JOB_ID=$(sbatch --parsable \
-    --job-name="msm_01_data" \
-    --partition="${GPU_PARTITION}" \
-    --time=02:00:00 \
-    --cpus-per-task=4 \
-    --mem=32G \
-    --output="logs/01_data_%j.out" \
-    --wrap="python3 scripts/01_download_data.py")
-echo "  -> Data Job ID: ${DATA_JOB_ID}"
+# 1. Environment & Conda Activation
+if ! command -v conda &> /dev/null; then
+    module load miniforge 2>/dev/null || module load anaconda3 2>/dev/null || true
+fi
+eval "$(conda shell.bash hook)"
+conda activate msm_env
 
-# Track all AFT + Eval job IDs so the final regression job waits for all of them
-EVAL_JOB_IDS=()
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export BASE_MODEL="meta-llama/Llama-3.1-8B"
+export ETA_OVERTRAIN="4.0"
+export WEIGHTING_MODE="loss_weight"
+export SPEC="pro_affordability"
+SEED=42
 
-for SEED in "${SEEDS[@]}"; do
-    # --------------------------------------------------------------------------
-    # Cell (0, 0): No MSM x Standard AFT (eta_mult = 1.0)
-    # Cell (0, 1): No MSM x Over-Training AFT (eta_mult = ETA_OVERTRAIN)
-    # Note: In the No-MSM arm, the cheese AFT training data is identical across
-    # both specs (as in Li et al. §3.1), so we train once per (seed, overtrain)
-    # and evaluate on both OOD benchmarks!
-    # --------------------------------------------------------------------------
-    for OT in 0 1; do
-        if [ "${OT}" -eq 0 ]; then
-            ETA="1.0"
-        else
-            ETA="${ETA_OVERTRAIN}"
-        fi
+# 2. Block 1: Download & Prepare Datasets
+if [ ! -f "data/aft_cheese.jsonl.done" ] || [ ! -f "data/it_simple_anchor.jsonl.done" ]; then
+    echo ">>> Running Block 1: Downloading & Caching Datasets..."
+    python scripts/01_download_data.py
+else
+    echo ">>> [Skip] Block 1 datasets already cached."
+fi
 
-        AFT_DIR="checkpoints/aft__spec-none__msm-0__overtrain-${OT}__seed-${SEED}"
-        AFT_JOB_ID=$(sbatch --parsable \
-            --dependency=afterok:${DATA_JOB_ID} \
-            --job-name="aft_m0_ot${OT}_s${SEED}" \
-            --partition="${GPU_PARTITION}" \
-            --gres="${GPU_GRES}" \
-            --time=06:00:00 \
-            --cpus-per-task=8 \
-            --mem=64G \
-            --requeue \
-            --output="logs/03_aft_m0_ot${OT}_s${SEED}_%j.out" \
-            --wrap="python3 scripts/03_run_aft.py \
-                --base_model ${BASE_MODEL} \
-                --msm_adapter_dir none \
-                --output_dir ${AFT_DIR} \
-                --eta_mult ${ETA} \
-                --weighting_mode ${WEIGHTING_MODE} \
-                --seed ${SEED}")
+# 3. Block 2: Stage 1 MSM Midtraining (Runs if adapter is not yet saved)
+MSM_CKPT="checkpoints/msm__spec-${SPEC}__seed-${SEED}"
+if [ ! -f "${MSM_CKPT}/adapter_config.json" ]; then
+    echo ">>> Running Block 2: MSM Midtraining (${SPEC}, seed=${SEED})..."
+    python scripts/02_run_msm.py \
+        --base_model "${BASE_MODEL}" \
+        --spec "${SPEC}" \
+        --output_dir "${MSM_CKPT}" \
+        --seed "${SEED}"
+else
+    echo ">>> [Skip] Block 2 MSM checkpoint already exists."
+fi
 
-        EVAL_OUT="results/eval__spec-none__msm-0__overtrain-${OT}__seed-${SEED}.jsonl"
-        EV_JOB_ID=$(sbatch --parsable \
-            --dependency=afterok:${AFT_JOB_ID} \
-            --job-name="eval_m0_ot${OT}_s${SEED}" \
-            --partition="${GPU_PARTITION}" \
-            --gres="${GPU_GRES}" \
-            --time=02:00:00 \
-            --cpus-per-task=4 \
-            --mem=48G \
-            --requeue \
-            --output="logs/04_eval_m0_ot${OT}_s${SEED}_%j.out" \
-            --wrap="python3 scripts/04_evaluate_and_regress.py \
-                --mode eval_single \
-                --base_model ${BASE_MODEL} \
-                --msm_dir none \
-                --aft_dir ${AFT_DIR} \
-                --out_jsonl ${EVAL_OUT}")
-        EVAL_JOB_IDS+=("${EV_JOB_ID}")
-    done
+# 4. Block 3: Stage 2 AFT Fine-Tuning (2x2 Matrix)
+# Cell 1_1: No MSM  x Standard AFT       (eta = 1.0)
+# Cell 1_2: No MSM  x Over-Training AFT  (eta = 4.0)
+# Cell 2_1: MSM     x Standard AFT       (eta = 1.0)
+# Cell 2_2: MSM     x Over-Training AFT  (eta = 4.0)
 
-    # --------------------------------------------------------------------------
-    # MSM Arms: For each spec in {pro_affordability, pro_america}
-    #   Stage 2: Train MSM adapter on ~8M synthetic spec docs
-    #   Stage 3: Train Cell (1, 0) Standard AFT (eta=1.0) & Cell (1, 1) Over-Training AFT (eta=ETA_OVERTRAIN)
-    #   Stage 4: Evaluate each checkpoint on OOD item & political opinion benchmarks
-    # --------------------------------------------------------------------------
-    for SPEC in "${SPECS[@]}"; do
-        MSM_DIR="checkpoints/msm__spec-${SPEC}__seed-${SEED}"
-        MSM_JOB_ID=$(sbatch --parsable \
-            --dependency=afterok:${DATA_JOB_ID} \
-            --job-name="msm_${SPEC}_s${SEED}" \
-            --partition="${GPU_PARTITION}" \
-            --gres="${GPU_GRES}" \
-            --time=08:00:00 \
-            --cpus-per-task=8 \
-            --mem=64G \
-            --requeue \
-            --output="logs/02_msm_${SPEC}_s${SEED}_%j.out" \
-            --wrap="python3 scripts/02_run_msm.py \
-                --base_model ${BASE_MODEL} \
-                --spec ${SPEC} \
-                --output_dir ${MSM_DIR} \
-                --seed ${SEED}")
+declare -A CELL_DIRS=(
+    ["1_1"]="checkpoints/aft__spec-${SPEC}__msm-0__overtrain-0__seed-${SEED}"
+    ["1_2"]="checkpoints/aft__spec-${SPEC}__msm-0__overtrain-1__seed-${SEED}"
+    ["2_1"]="checkpoints/aft__spec-${SPEC}__msm-1__overtrain-0__seed-${SEED}"
+    ["2_2"]="checkpoints/aft__spec-${SPEC}__msm-1__overtrain-1__seed-${SEED}"
+)
 
-        for OT in 0 1; do
-            if [ "${OT}" -eq 0 ]; then
-                ETA="1.0"
-            else
-                ETA="${ETA_OVERTRAIN}"
-            fi
+declare -A CELL_MSM=(
+    ["1_1"]="none"
+    ["1_2"]="none"
+    ["2_1"]="${MSM_CKPT}"
+    ["2_2"]="${MSM_CKPT}"
+)
 
-            AFT_DIR="checkpoints/aft__spec-${SPEC}__msm-1__overtrain-${OT}__seed-${SEED}"
-            AFT_JOB_ID=$(sbatch --parsable \
-                --dependency=afterok:${MSM_JOB_ID} \
-                --job-name="aft_${SPEC}_ot${OT}_s${SEED}" \
-                --partition="${GPU_PARTITION}" \
-                --gres="${GPU_GRES}" \
-                --time=06:00:00 \
-                --cpus-per-task=8 \
-                --mem=64G \
-                --requeue \
-                --output="logs/03_aft_${SPEC}_ot${OT}_s${SEED}_%j.out" \
-                --wrap="python3 scripts/03_run_aft.py \
-                    --base_model ${BASE_MODEL} \
-                    --msm_adapter_dir ${MSM_DIR} \
-                    --output_dir ${AFT_DIR} \
-                    --eta_mult ${ETA} \
-                    --weighting_mode ${WEIGHTING_MODE} \
-                    --seed ${SEED}")
+declare -A CELL_ETA=(
+    ["1_1"]="1.0"
+    ["1_2"]="${ETA_OVERTRAIN}"
+    ["2_1"]="1.0"
+    ["2_2"]="${ETA_OVERTRAIN}"
+)
 
-            EVAL_OUT="results/eval__spec-${SPEC}__msm-1__overtrain-${OT}__seed-${SEED}.jsonl"
-            EV_JOB_ID=$(sbatch --parsable \
-                --dependency=afterok:${AFT_JOB_ID} \
-                --job-name="eval_${SPEC}_ot${OT}_s${SEED}" \
-                --partition="${GPU_PARTITION}" \
-                --gres="${GPU_GRES}" \
-                --time=02:00:00 \
-                --cpus-per-task=4 \
-                --mem=48G \
-                --requeue \
-                --output="logs/04_eval_${SPEC}_ot${OT}_s${SEED}_%j.out" \
-                --wrap="python3 scripts/04_evaluate_and_regress.py \
-                    --mode eval_single \
-                    --base_model ${BASE_MODEL} \
-                    --msm_dir ${MSM_DIR} \
-                    --aft_dir ${AFT_DIR} \
-                    --out_jsonl ${EVAL_OUT}")
-            EVAL_JOB_IDS+=("${EV_JOB_ID}")
-        done
-    done
+for CELL in "1_1" "1_2" "2_1" "2_2"; do
+    TARGET_DIR="${CELL_DIRS[$CELL]}"
+    if [ ! -f "${TARGET_DIR}/adapter_config.json" ]; then
+        echo ">>> Running Block 3: Training Cell ${CELL} [MSM=${CELL_MSM[$CELL]}, eta=${CELL_ETA[$CELL]}]..."
+        python scripts/03_run_aft.py \
+            --base_model "${BASE_MODEL}" \
+            --msm_adapter_dir "${CELL_MSM[$CELL]}" \
+            --output_dir "${TARGET_DIR}" \
+            --eta_mult "${CELL_ETA[$CELL]}" \
+            --weighting_mode "${WEIGHTING_MODE}" \
+            --seed "${SEED}"
+    else
+        echo ">>> [Skip] Cell ${CELL} already trained at ${TARGET_DIR}."
+    fi
 done
 
-DEP_LIST=$(IFS=:; echo "${EVAL_JOB_IDS[*]}")
-REG_JOB_ID=$(sbatch --parsable \
-    --dependency=afterok:${DEP_LIST} \
-    --job-name="msm_05_regress" \
-    --partition="${GPU_PARTITION}" \
-    --time=00:30:00 \
-    --cpus-per-task=2 \
-    --mem=16G \
-    --output="logs/05_regress_%j.out" \
-    --wrap="python3 scripts/04_evaluate_and_regress.py --mode regress --results_dir results")
+# 5. Block 4: Evaluation across all 4 checkpoints
+for CELL in "1_1" "1_2" "2_1" "2_2"; do
+    AFT_DIR="${CELL_DIRS[$CELL]}"
+    MSM_ARG="${CELL_MSM[$CELL]}"
+    OT_FLAG="0"
+    if [ "$CELL" == "1_2" ] || [ "$CELL" == "2_2" ]; then
+        OT_FLAG="1"
+    fi
+    MSM_FLAG="0"
+    if [ "$CELL" == "2_1" ] || [ "$CELL" == "2_2" ]; then
+        MSM_FLAG="1"
+    fi
 
-echo "[4/4] Submitted Final Regression Summary Job: ${REG_JOB_ID}"
-echo "All jobs queued! Monitor progress with: squeue -u \$USER"
+    EVAL_OUT="results/eval__spec-${SPEC}__msm-${MSM_FLAG}__overtrain-${OT_FLAG}__seed-${SEED}.jsonl"
+    if [ ! -f "${EVAL_OUT}.done" ]; then
+        echo ">>> Running Block 4: Evaluating Cell ${CELL}..."
+        python scripts/04_evaluate_and_regress.py \
+            --mode eval_single \
+            --base_model "${BASE_MODEL}" \
+            --msm_dir "${MSM_ARG}" \
+            --aft_dir "${AFT_DIR}" \
+            --out_jsonl "${EVAL_OUT}"
+    else
+        echo ">>> [Skip] Evaluation for Cell ${CELL} already complete."
+    fi
+done
+
+# 6. Block 5: Compile 2x2 Regression Table & Cell Means
+echo ">>> Running Block 5: Compiling Econometric Regression Report..."
+python scripts/04_evaluate_and_regress.py --mode regress --results_dir results
+
+echo "============================================================"
+echo " Pipeline Complete at $(date)!"
+echo " Summary report available at: $PROJECT_DIR/results/regression_summary.md"
+echo "============================================================"
