@@ -25,8 +25,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows = []
+    if not path.exists():
+        return rows
     with open(path, "r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
 
 def format_affordability_prompt(row: Dict[str, Any], flip: bool = False) -> Dict[str, Any]:
     liked = row.get("liked_item") or row.get("aligned_item") or row.get("item_1")
@@ -96,7 +107,7 @@ def evaluate_checkpoint(
     aft_dir: str,
     data_dir: Path,
     out_jsonl: Path,
-    batch_size: int = 16,
+    batch_size: int = 8,
 ):
     done_marker = out_jsonl.with_suffix(".done")
     if out_jsonl.exists() and done_marker.exists():
@@ -117,10 +128,16 @@ def evaluate_checkpoint(
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        base_model_name, dtype=torch.bfloat16, device_map="auto"
-    )
+        base_model_name,
+        dtype=torch.bfloat16,
+    ).to("cuda")
     if msm_dir != "none":
-        model = PeftModel.from_pretrained(model, msm_dir).merge_and_unload()
+        peft_msm = PeftModel.from_pretrained(model, msm_dir)
+        model = peft_msm.merge_and_unload()
+        del peft_msm
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
     if aft_dir != "none":
         model = PeftModel.from_pretrained(model, aft_dir)
     model.eval()
@@ -211,14 +228,32 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
 
     lines = ["# 2x2 Experiment Results: {No MSM, MSM} x {Standard AFT, Over-Training AFT (eta)}\n"]
     for target_eval in ["pro_affordability", "pro_america"]:
-        sub = df[(df["eval_type"] == target_eval) & ((df["spec"] == target_eval) | (df["msm"] == 0))].copy()
-        if sub.empty:
-            continue
+        # Only evaluate on records matching the current eval benchmark
+        # Filter strictly to the spec matching target_eval for MSM=1, while deduplicating MSM=0
+        sub_msm1 = df[(df["eval_type"] == target_eval) & (df["msm"] == 1) & (df["spec"] == target_eval)]
+        sub_msm0 = df[(df["eval_type"] == target_eval) & (df["msm"] == 0)].drop_duplicates(
+            subset=["overtrain", "item_id", "seed"]
+        )
+        sub = pd.concat([sub_msm1, sub_msm0], ignore_index=True)
 
         lines.append(f"## Target Evaluation: `{target_eval}`")
+
+        if sub.empty:
+            lines.append(f"\n*No evaluation data found for `{target_eval}`.*\n")
+            continue
+
         cell_means = sub.groupby(["msm", "overtrain"])["aligned"].agg(["mean", "std", "count"]).reset_index()
         lines.append("\n### Cell Means")
         lines.append(cell_means.to_markdown(index=False))
+
+        # Require a complete 2x2 grid (both MSM arms and both overtrain arms) to run OLS
+        if sub["msm"].nunique() < 2 or sub["overtrain"].nunique() < 2:
+            lines.append(
+                f"\n*Notice: Incomplete 2x2 grid for `{target_eval}` "
+                f"(MSM levels: {sorted(sub['msm'].unique().tolist())}, "
+                f"Over-training levels: {sorted(sub['overtrain'].unique().tolist())}). Skipping OLS.*\n"
+            )
+            continue
 
         # OLS with standard errors clustered by eval item_id
         model = smf.ols("aligned ~ msm * overtrain", data=sub).fit(
