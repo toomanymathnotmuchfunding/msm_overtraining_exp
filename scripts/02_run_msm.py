@@ -39,8 +39,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_seq_length", type=int, default=4096)
-    parser.add_argument("--per_device_batch_size", type=int, default=4)
-    parser.add_argument("--grad_accum_steps", type=int, default=8)
+    parser.add_argument("--per_device_batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum_steps", type=int, default=16)
     parser.add_argument("--save_steps", type=int, default=100)
     return parser.parse_args()
 
