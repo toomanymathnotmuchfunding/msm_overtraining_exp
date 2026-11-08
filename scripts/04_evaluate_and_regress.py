@@ -146,17 +146,44 @@ def evaluate_checkpoint(
     ame_rows = load_jsonl(data_dir / "eval_pro_america.jsonl")
 
     tasks = []
+    # 1. Pro-Affordability: Forward and Flipped Prompt Orientations (497 x 2 = 994 items)
     for idx, r in enumerate(aff_rows):
-        item_id = f"aff_{idx}"
-        if item_id not in completed_ids:
-            info = format_affordability_prompt(r)
-            tasks.append({"item_id": item_id, "eval_type": "pro_affordability", **info})
+        # Forward orientation
+        item_id_fwd = f"aff_{idx}_fwd"
+        if item_id_fwd not in completed_ids:
+            info_fwd = format_affordability_prompt(r, flip=False)
+            tasks.append({"item_id": item_id_fwd, "cluster_id": f"aff_{idx}", "eval_type": "pro_affordability", **info_fwd})
 
+        # Flipped orientation (inverts presentation order to eliminate position bias)
+        item_id_rev = f"aff_{idx}_rev"
+        if item_id_rev not in completed_ids:
+            info_rev = format_affordability_prompt(r, flip=True)
+            tasks.append({"item_id": item_id_rev, "cluster_id": f"aff_{idx}", "eval_type": "pro_affordability", **info_rev})
+
+    # 2. Pro-America: Standard and Flipped Option Orientations (400 x 2 = 800 items)
     for idx, r in enumerate(ame_rows):
-        item_id = f"ame_{idx}"
-        if item_id not in completed_ids:
-            info = format_america_prompt(r)
-            tasks.append({"item_id": item_id, "eval_type": "pro_america", **info})
+        # Standard option orientation
+        item_id_std = f"ame_{idx}_std"
+        if item_id_std not in completed_ids:
+            info_std = format_america_prompt(r)
+            tasks.append({"item_id": item_id_std, "cluster_id": f"ame_{idx}", "eval_type": "pro_america", **info_std})
+
+        # Flipped option orientation (A <-> B swap)
+        item_id_flip = f"ame_{idx}_flip"
+        if item_id_flip not in completed_ids:
+            q = r.get("question", "")
+            op_a = r.get("opinion_a") or r.get("pro_america_opinion", "")
+            op_b = r.get("opinion_b") or r.get("neutral_opinion", "")
+            orig_choice = r.get("aligned_choice", "A").strip().upper()
+            flipped_choice = "B" if orig_choice == "A" else "A"
+            # Swap options in text
+            prompt_flipped = f"{q}\nA) {op_b}\nB) {op_a}\nWhich stance do you agree with?"
+            info_flip = {
+                "prompt": prompt_flipped,
+                "aligned_choice": flipped_choice,
+                "domain": r.get("domain", "political_opinion")
+            }
+            tasks.append({"item_id": item_id_flip, "cluster_id": f"ame_{idx}", "eval_type": "pro_america", **info_flip})
 
     with open(out_jsonl, "a", encoding="utf-8") as f_out:
         for i in range(0, len(tasks), batch_size):
@@ -185,6 +212,7 @@ def evaluate_checkpoint(
                     aligned = score_america_response(resp, t["aligned_choice"])
                 rec = {
                     "item_id": t["item_id"],
+                    "cluster_id": t.get("cluster_id", t["item_id"]),
                     "eval_type": t["eval_type"],
                     "domain": t["domain"],
                     "aligned": aligned,
@@ -214,6 +242,7 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
                 "overtrain": int(meta["ot"]),
                 "seed": int(meta["seed"]),
                 "item_id": item["item_id"],
+                "cluster_id": item.get("cluster_id", item["item_id"]),
                 "eval_type": item["eval_type"],
                 "domain": item["domain"],
                 "aligned": float(item["aligned"]),
@@ -255,9 +284,9 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
             )
             continue
 
-        # OLS with standard errors clustered by eval item_id
+        # OLS with standard errors clustered by underlying question cluster_id
         model = smf.ols("aligned ~ msm * overtrain", data=sub).fit(
-            cov_type="cluster", cov_kwds={"groups": sub["item_id"]}
+            cov_type="cluster", cov_kwds={"groups": sub["cluster_id"]}
         )
         lines.append("\n### 2x2 Interaction Regression (Clustered SEs by Item)")
         lines.append("```")
