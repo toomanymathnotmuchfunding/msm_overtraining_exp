@@ -132,13 +132,41 @@ def evaluate_checkpoint(
         torch_dtype=torch.bfloat16,
     ).to("cuda")
     if msm_dir != "none":
+        # Sanitize adapter config before loading to prevent LoraConfig init crashes
+        cfg_path = Path(msm_dir) / "adapter_config.json"
+        if cfg_path.exists():
+            try:
+                import inspect
+                from peft import LoraConfig
+                cfg_dict = json.loads(cfg_path.read_text())
+                valid_params = set(inspect.signature(LoraConfig.__init__).parameters.keys())
+                cleaned = {k: v for k, v in cfg_dict.items() if k in valid_params or k == "peft_type"}
+                if set(cfg_dict.keys()) != set(cleaned.keys()):
+                    cfg_path.write_text(json.dumps(cleaned, indent=2))
+            except Exception as e:
+                print(f"[WARN] Error sanitizing msm adapter_config: {e}")
+
         peft_msm = PeftModel.from_pretrained(model, msm_dir)
         model = peft_msm.merge_and_unload()
         del peft_msm
         import gc
         gc.collect()
         torch.cuda.empty_cache()
+
     if aft_dir != "none":
+        cfg_path = Path(aft_dir) / "adapter_config.json"
+        if cfg_path.exists():
+            try:
+                import inspect
+                from peft import LoraConfig
+                cfg_dict = json.loads(cfg_path.read_text())
+                valid_params = set(inspect.signature(LoraConfig.__init__).parameters.keys())
+                cleaned = {k: v for k, v in cfg_dict.items() if k in valid_params or k == "peft_type"}
+                if set(cfg_dict.keys()) != set(cleaned.keys()):
+                    cfg_path.write_text(json.dumps(cleaned, indent=2))
+            except Exception as e:
+                print(f"[WARN] Error sanitizing aft adapter_config: {e}")
+
         model = PeftModel.from_pretrained(model, aft_dir)
     model.eval()
 
@@ -226,12 +254,11 @@ def evaluate_checkpoint(
 
 def run_econometric_analysis(results_dir: Path, output_report: Path):
     rows = []
-    for fpath in sorted(results_dir.glob("eval_*.jsonl")):
-        # Expected filename format: eval__spec-{spec}__msm-{0|1}__overtrain-{0|1}__seed-{s}.jsonl
-        m = re.match(
-            r"eval__spec-(?P<spec>[a-z_]+)__msm-(?P<msm>[01])__overtrain-(?P<ot>[01])__seed-(?P<seed>\d+)\.jsonl",
-            fpath.name,
-        )
+    fname_pattern = re.compile(
+        r"eval__spec-(?P<spec>[a-zA-Z0-9_]+)__msm-(?P<msm>[01])__overtrain-(?P<ot>[01])(?:__eta-(?P<eta>[\d\.]+))?__seed-(?P<seed>\d+)\.jsonl"
+    )
+    for fpath in sorted(results_dir.glob("eval__*.jsonl")):
+        m = fname_pattern.match(fpath.name)
         if not m:
             continue
         meta = m.groupdict()
