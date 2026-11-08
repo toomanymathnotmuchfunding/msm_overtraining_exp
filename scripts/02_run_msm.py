@@ -132,6 +132,7 @@ def main():
         save_total_limit=2,
         bf16=True,
         gradient_checkpointing=True,
+        remove_unused_columns=False,
         report_to="none",
         seed=args.seed,
     )
