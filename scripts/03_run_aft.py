@@ -242,6 +242,27 @@ def main():
 
     # If MSM checkpoint provided, merge it into base weights
     if args.msm_adapter_dir and args.msm_adapter_dir.lower() != "none":
+        print(f"[STAGE] Merging MSM adapter from {args.msm_adapter_dir}...")
+        cfg_file = Path(args.msm_adapter_dir) / "adapter_config.json"
+        if cfg_file.exists():
+            try:
+                cfg_data = json.loads(cfg_file.read_text())
+                unsupported_keys = [
+                    "alora_invocation_tokens",
+                    "eva_config",
+                    "exclude_modules",
+                ]
+                cleaned = False
+                for k in unsupported_keys:
+                    if k in cfg_data:
+                        cfg_data.pop(k, None)
+                        cleaned = True
+                if cleaned:
+                    cfg_file.write_text(json.dumps(cfg_data, indent=2))
+                    print(f"[STAGE] Sanitized {cfg_file.name} to remove unsupported PEFT keys.")
+            except Exception as e:
+                print(f"[WARN] Could not sanitize adapter_config.json: {e}")
+
         peft_msm = PeftModel.from_pretrained(model, args.msm_adapter_dir)
         model = peft_msm.merge_and_unload()
         del peft_msm
