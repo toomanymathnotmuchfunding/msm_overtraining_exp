@@ -237,7 +237,7 @@ def main():
     # Load base model
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
     )
 
     # If MSM checkpoint provided, merge it into base weights

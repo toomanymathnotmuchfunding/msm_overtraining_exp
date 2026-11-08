@@ -129,7 +129,7 @@ def evaluate_checkpoint(
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
     ).to("cuda")
     if msm_dir != "none":
         peft_msm = PeftModel.from_pretrained(model, msm_dir)
