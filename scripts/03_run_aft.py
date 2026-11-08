@@ -96,7 +96,7 @@ class WeightedDataCollator:
             input_ids.append(f["input_ids"] + [self.pad_token_id] * pad_len)
             attention_mask.append([1] * len(f["input_ids"]) + [0] * pad_len)
             labels.append(f["labels"] + [-100] * pad_len)
-            weights.append(f["sample_weight"])
+            weights.append(f.get("sample_weight", 1.0))
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
@@ -284,6 +284,7 @@ def main():
         save_total_limit=2,
         bf16=True,
         gradient_checkpointing=True,
+        remove_unused_columns=False,
         report_to="none",
         seed=args.seed,
     )
