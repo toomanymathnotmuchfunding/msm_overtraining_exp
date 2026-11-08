@@ -246,22 +246,24 @@ def main():
         cfg_file = Path(args.msm_adapter_dir) / "adapter_config.json"
         if cfg_file.exists():
             try:
+                import inspect
+                from peft import LoraConfig
                 cfg_data = json.loads(cfg_file.read_text())
-                unsupported_keys = [
-                    "alora_invocation_tokens",
-                    "eva_config",
-                    "exclude_modules",
-                ]
-                cleaned = False
-                for k in unsupported_keys:
-                    if k in cfg_data:
-                        cfg_data.pop(k, None)
-                        cleaned = True
-                if cleaned:
-                    cfg_file.write_text(json.dumps(cfg_data, indent=2))
-                    print(f"[STAGE] Sanitized {cfg_file.name} to remove unsupported PEFT keys.")
+                valid_params = set(inspect.signature(LoraConfig.__init__).parameters.keys())
+                cleaned_data = {k: v for k, v in cfg_data.items() if k in valid_params or k == "peft_type"}
+                dropped = set(cfg_data.keys()) - set(cleaned_data.keys())
+                if dropped:
+                    cfg_file.write_text(json.dumps(cleaned_data, indent=2))
+                    print(f"[STAGE] Filtered out unsupported PEFT keys: {dropped}")
             except Exception as e:
                 print(f"[WARN] Could not sanitize adapter_config.json: {e}")
+
+        peft_msm = PeftModel.from_pretrained(model, args.msm_adapter_dir)
+        model = peft_msm.merge_and_unload()
+        del peft_msm
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
         peft_msm = PeftModel.from_pretrained(model, args.msm_adapter_dir)
         model = peft_msm.merge_and_unload()
