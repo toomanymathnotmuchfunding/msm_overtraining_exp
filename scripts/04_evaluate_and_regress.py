@@ -121,8 +121,7 @@ def evaluate_checkpoint(
             completed_ids.add(row["item_id"])
         print(f"[RESUME] Found {len(completed_ids)} already evaluated items in {out_jsonl}")
 
-    tokenizer_src = aft_dir if (aft_dir != "none" and Path(aft_dir).exists()) else base_model_name
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

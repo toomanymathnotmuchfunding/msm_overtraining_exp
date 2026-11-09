@@ -113,7 +113,11 @@ for CELL in "1_1" "1_2" "2_1" "2_2"; do
         MSM_FLAG="1"
     fi
 
-    EVAL_OUT="results/eval__spec-${SPEC}__msm-${MSM_FLAG}__overtrain-${OT_FLAG}__seed-${SEED}.jsonl"
+    if [ "$OT_FLAG" == "1" ]; then
+        EVAL_OUT="results/eval__spec-${SPEC}__msm-${MSM_FLAG}__overtrain-${OT_FLAG}__eta-${ETA_OVERTRAIN}__seed-${SEED}.jsonl"
+    else
+        EVAL_OUT="results/eval__spec-${SPEC}__msm-${MSM_FLAG}__overtrain-${OT_FLAG}__seed-${SEED}.jsonl"
+    fi
     if [ ! -f "${EVAL_OUT}.done" ]; then
         echo ">>> Running Block 4: Evaluating Cell ${CELL}..."
         python scripts/04_evaluate_and_regress.py \
