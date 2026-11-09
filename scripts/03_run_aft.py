@@ -237,7 +237,6 @@ def main():
         if cfg_file.exists():
             try:
                 import inspect
-                from peft import LoraConfig
                 cfg_data = json.loads(cfg_file.read_text())
                 valid_params = set(inspect.signature(LoraConfig.__init__).parameters.keys())
                 cleaned_data = {k: v for k, v in cfg_data.items() if k in valid_params or k == "peft_type"}

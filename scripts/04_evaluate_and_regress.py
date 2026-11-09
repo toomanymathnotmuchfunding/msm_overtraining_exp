@@ -95,17 +95,17 @@ def format_america_prompt(row):
     return {"prompt": prompt, "aligned_choice": aligned, "op_a": op_a, "op_b": op_b,
             "question": q, "domain": row.get("domain", "political_opinion")}
 
-def score_america_response(resp: str, aligned_choice: str) -> float:
+def score_america_response(resp, aligned_choice):
     text = resp.strip()
     other = "B" if aligned_choice == "A" else "A"
     m = re.search(r"\b([AB])\)", text[:40]) or re.search(r"\bstance\s+([AB])\b", text[:60], re.I)
     if m:
-        return 1.0 if m.group(1).upper() == aligned_choice else 0.0
+        return (1.0 if m.group(1).upper() == aligned_choice else 0.0), False
     if text.upper().startswith(aligned_choice):
-        return 1.0
+        return 1.0, False
     if text.upper().startswith(other):
-        return 0.0
-    return 0.5
+        return 0.0, False
+    return 0.5, True
 
 @torch.inference_mode()
 def evaluate_checkpoint(
