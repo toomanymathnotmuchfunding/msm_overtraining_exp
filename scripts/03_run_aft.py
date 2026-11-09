@@ -105,39 +105,29 @@ class WeightedDataCollator:
         }
 
 class EtaWeightedTrainer(Trainer):
-    """
-    Custom Trainer implementing exact Gao & Wolitzky (2026) eta-weighted loss:
-      When sample_weight == 1.0 for all samples (base case eta_mult=1.0),
-      this reduces bit-for-bit to standard cross-entropy loss over non-masked tokens.
-    """
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        sample_weight = inputs.pop("sample_weight", None)
-        labels = inputs.get("labels")
+        sample_weight = inputs.pop("sample_weight")   # [B], scalar per sample
+        labels = inputs["labels"]
 
         outputs = model(**inputs)
-        logits = outputs.get("logits")
+        logits = outputs.logits
 
-        # Shift tokens for next-token prediction
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-        token_losses = loss_fct(
+        token_losses = torch.nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1)
-        ).view(shift_labels.size())
+            shift_labels.view(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view(shift_labels.size())                   # [B, T]
 
-        valid_mask = (shift_labels != -100).to(token_losses.dtype)
+        valid = (shift_labels != -100).to(token_losses.dtype)  # [B, T]
 
-        if sample_weight is not None:
-            # Per-sample weighting: compute average loss per valid token, then weight by sample_weight
-            per_token_valid = valid_mask.sum(dim=-1).clamp(min=1.0)
-            per_sample_loss = (token_losses * valid_mask).sum(dim=-1) / per_token_valid
-            w = sample_weight.to(per_sample_loss.dtype)
-            loss = (per_sample_loss * w).sum() / w.sum().clamp(min=1e-8)
-        else:
-            loss = (token_losses * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+        # Broadcast the sample weight to every valid token in that sample
+        token_weights = sample_weight.to(token_losses.dtype).unsqueeze(-1) * valid  # [B, T]
 
+        loss = (token_losses * token_weights).sum() / token_weights.sum().clamp(min=1e-8)
         return (loss, outputs) if return_outputs else loss
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -265,13 +255,6 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-        peft_msm = PeftModel.from_pretrained(model, args.msm_adapter_dir)
-        model = peft_msm.merge_and_unload()
-        del peft_msm
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-
     lora_config = LoraConfig(
         r=64,
         lora_alpha=128,
@@ -298,7 +281,9 @@ def main():
         output_dir=str(out_dir),
         per_device_train_batch_size=per_device_batch_size,
         gradient_accumulation_steps=grad_accum_steps,
-        learning_rate=2e-5,
+        learning_rate=1e-4,              
+        lr_scheduler_type="cosine",       
+        weight_decay=0.01,                
         num_train_epochs=epochs,
         warmup_steps=warmup_steps,
         logging_steps=10,

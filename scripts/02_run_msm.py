@@ -31,6 +31,62 @@ TARGET_MODULES = [
     "gate_proj", "up_proj", "down_proj"
 ]
 
+def download_pretrained_msm(args, out_dir: Path, done_file: Path) -> None:
+    """Fetch a pre-trained MSM LoRA adapter from HF into out_dir and write the done marker."""
+    from huggingface_hub import snapshot_download, HfApi
+    from huggingface_hub.utils import RepositoryNotFoundError
+
+    repo = args.hf_adapter_repo.strip() or f"chloeli/msm-llama-{args.spec}-lora"
+    print(f"[HF] Fetching pre-trained MSM adapter: {repo}")
+
+    # 1. Resolve and verify the repo exists before downloading
+    api = HfApi()
+    try:
+        info = api.model_info(repo)
+    except RepositoryNotFoundError as e:
+        raise SystemExit(
+            f"[HF] Repo not found: {repo}\n"
+            f"     Either pass --hf_adapter_repo <org/name> explicitly, or omit --use_pretrained_hf to train from scratch.\n"
+            f"     If the repo is private, set HF_TOKEN in the environment."
+        ) from e
+
+    # 2. Download only the files we need (adapter + tokenizer, no optimizer/checkpoint state)
+    snapshot_download(
+        repo_id=repo,
+        local_dir=str(out_dir),
+        allow_patterns=[
+            "adapter_config.json",
+            "adapter_model.safetensors",
+            "adapter_model.bin",
+            "config.json",
+            "tokenizer*",
+            "special_tokens_map.json",
+            "generation_config.json",
+            "training_args.bin",
+        ],
+    )
+
+    # 3. Validate that we actually got a loadable LoRA adapter
+    adapter_cfg = out_dir / "adapter_config.json"
+    has_weights = (
+        (out_dir / "adapter_model.safetensors").exists()
+        or (out_dir / "adapter_model.bin").exists()
+    )
+    if not adapter_cfg.exists() or not has_weights:
+        raise SystemExit(
+            f"[HF] Downloaded {repo} to {out_dir}, but adapter_config.json or adapter weights are missing. "
+            f"Files present: {sorted(p.name for p in out_dir.iterdir())}. "
+            f"This usually means {repo} is a dataset repo or a full model repo, not a LoRA adapter repo."
+        )
+
+    # 4. Provenance: record the exact commit SHA for reproducibility
+    done_file.write_text(
+        f"source=hf_pretrained\n"
+        f"repo={repo}\n"
+        f"revision={info.sha}\n"
+    )
+    print(f"[HF] Saved pre-trained MSM adapter from {repo} (revision {info.sha}) to {out_dir}")
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model", type=str, default="meta-llama/Llama-3.1-8B")
@@ -42,6 +98,11 @@ def parse_args():
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--grad_accum_steps", type=int, default=16)
     parser.add_argument("--save_steps", type=int, default=100)
+    parser.add_argument("--use_pretrained_hf", action="store_true",
+                    help="Skip MSM training; download a pre-trained MSM LoRA adapter from HF instead.")
+    parser.add_argument("--hf_adapter_repo", type=str, default="",
+                        help="HF model repo ID for the pre-trained MSM adapter "
+                            "(default: chloeli/msm-llama-<spec>-lora). Only used with --use_pretrained_hf.")
     return parser.parse_args()
 
 def main():
@@ -51,6 +112,12 @@ def main():
 
     if done_file.exists():
         print(f"[SKIP] MSM already completed at {out_dir}")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.use_pretrained_hf:
+        download_pretrained_msm(args, out_dir, done_file)
         return
 
     set_seed(args.seed)
@@ -124,6 +191,8 @@ def main():
         per_device_train_batch_size=per_device_batch_size,
         gradient_accumulation_steps=grad_accum_steps,
         learning_rate=1e-4,
+        lr_scheduler_type="cosine",
+        weight_decay=0.01,
         num_train_epochs=epochs,
         warmup_steps=warmup_steps,
         logging_steps=10,
