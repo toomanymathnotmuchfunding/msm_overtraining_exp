@@ -126,6 +126,18 @@ def evaluate_checkpoint(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Ensure Llama-3 chat template is present for base models
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = (
+            "{{- bos_token }}"
+            "{%- for message in messages %}"
+                "{{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>' }}"
+            "{%- endfor %}"
+            "{%- if add_generation_prompt %}"
+                "{{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"
+            "{%- endif %}"
+        )
+
     model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
         torch_dtype=torch.bfloat16,
