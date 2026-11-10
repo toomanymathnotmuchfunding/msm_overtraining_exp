@@ -277,14 +277,16 @@ def _as_flag(val):
 def run_econometric_analysis(results_dir: Path, output_report: Path):
     rows = []
     fname_pattern = re.compile(
-        r"eval__spec-(?P<spec>[a-zA-Z0-9_]+)__msm-(?P<msm>[01])__overtrain-(?P<ot>[01])"
-        r"(?:__eta-(?P<eta>[\d\.]+))?__seed-(?P<seed>\d+)\.jsonl"
+        r"eval__spec-(?P<spec>[a-zA-Z0-9_]+)__msm-(?P<msm>[01])"
+        r"(?:__overtrain-(?P<ot>[01])(?:__eta-(?P<eta>[\d\.]+))?|__aft-none)"
+        r"__seed-(?P<seed>\d+)\.jsonl"
     )
     for fpath in sorted(results_dir.glob("eval__*.jsonl")):
         m = fname_pattern.match(fpath.name)
         if not m:
             continue
         meta = m.groupdict()
+        is_control = meta["ot"] is None  # __aft-none branch
         for item in load_jsonl(fpath):
             try:
                 aligned = _as_score(item["aligned"])
@@ -294,8 +296,10 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
             rows.append({
                 "spec": meta["spec"],
                 "msm": int(meta["msm"]),
-                "overtrain": int(meta["ot"]),
+                "overtrain": -1 if is_control else int(meta["ot"]),
+                "eta": float(meta["eta"]) if meta["eta"] else 1.0,
                 "seed": int(meta["seed"]),
+                "condition": "control" if is_control else "aft",
                 "item_id": item["item_id"],
                 "cluster_id": item.get("cluster_id", item["item_id"]),
                 "eval_type": item["eval_type"],
@@ -312,13 +316,38 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
     df.to_csv(results_dir / "compiled_2x2_panel.csv", index=False)
 
     lines = ["# 2x2 Experiment Results: {No MSM, MSM} x {Standard AFT, Over-Training AFT (eta)}\n"]
+
+    # ---- Control panel (no AFT) ----
+    lines.append("## Control Conditions (No AFT)")
+    for target_eval in ["pro_affordability", "pro_america"]:
+        ctrl = df[(df["condition"] == "control") & (df["eval_type"] == target_eval)]
+        if ctrl.empty:
+            continue
+        means = (
+            ctrl.groupby("msm")["aligned"]
+            .agg(["mean", "std", "count"])
+            .rename(index={0: "Base (no MSM, no AFT)", 1: "MSM only (no AFT)"})
+            .reset_index()
+        )
+        lines.append(f"\n### `{target_eval}`")
+        lines.append(means.to_markdown(index=False))
+    lines.append("")
+
+    lines = ["# 2x2 Experiment Results: {No MSM, MSM} x {Standard AFT, Over-Training AFT (eta)}\n"]
     for target_eval in ["pro_affordability", "pro_america"]:
         # Only evaluate on records matching the current eval benchmark
-        # Filter strictly to the spec matching target_eval for MSM=1, while deduplicating MSM=0
-        sub_msm1 = df[(df["eval_type"] == target_eval) & (df["msm"] == 1) & (df["spec"] == target_eval)]
-        sub_msm0 = df[(df["eval_type"] == target_eval) & (df["msm"] == 0)].drop_duplicates(
-            subset=["overtrain", "item_id", "seed"]
-        )
+        # Filter strictly to the spec matching target_eval for MSM=1, while deduplicating MSM=0     
+        sub_msm1 = df[
+            (df["eval_type"] == target_eval)
+            & (df["condition"] == "aft")
+            & (df["msm"] == 1)
+            & (df["spec"] == target_eval)
+        ]
+        sub_msm0 = df[
+            (df["eval_type"] == target_eval)
+            & (df["condition"] == "aft")
+            & (df["msm"] == 0)
+        ].drop_duplicates(subset=["overtrain", "item_id", "seed"])
         sub = pd.concat([sub_msm1, sub_msm0], ignore_index=True)
 
         lines.append(f"## Target Evaluation: `{target_eval}`")
@@ -352,9 +381,86 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
     output_report.write_text("\n".join(lines), encoding="utf-8")
     print(f"[REPORT] Saved econometric tables to {output_report}")
 
+def generate_bar_plot(results_dir: Path) -> None:
+    """Bar chart of pro_affordability accuracy across all six conditions."""
+    panel_path = results_dir / "compiled_2x2_panel.csv"
+    if not panel_path.exists():
+        print(f"[PLOT] No panel CSV at {panel_path} — run regress first.")
+        return
+
+    df = pd.read_csv(panel_path)
+    aff = df[df["eval_type"] == "pro_affordability"].copy()
+    if aff.empty:
+        print("[PLOT] No pro_affordability rows in panel.")
+        return
+
+    def label(row):
+        if row["condition"] == "control":
+            return "Base" if row["msm"] == 0 else "Base + MSM"
+        tag = "MSM + AFT" if row["msm"] == 1 else "AFT"
+        if row["overtrain"] == 0 or abs(row["eta"] - 1.0) < 1e-9:
+            return f"{tag} (eta=1)"
+        return f"{tag} (eta={row['eta']:g})"
+
+    aff["label"] = aff.apply(label, axis=1)
+    summary = (
+        aff.groupby("label", sort=False)["aligned"]
+        .agg(mean="mean", sem="sem", n="count")
+        .reset_index()
+    )
+
+    # Enforce a stable, logical order
+    order = [
+        "Base", "Base + MSM",
+        "AFT (eta=1)", "AFT (eta=2)", "AFT (eta=4)",
+        "MSM + AFT (eta=1)", "MSM + AFT (eta=2)", "MSM + AFT (eta=4)",
+    ]
+    summary["__ord"] = summary["label"].map({k: i for i, k in enumerate(order)}).fillna(999)
+    summary = summary.sort_values("__ord").drop(columns="__ord")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    color_map = {
+        "Base": "#888888",
+        "Base + MSM": "#4477AA",
+    }
+    colors = [
+        color_map.get(lbl, "#CC6677" if "MSM" not in lbl else "#44AA99")
+        for lbl in summary["label"]
+    ]
+    bars = ax.bar(
+        summary["label"], summary["mean"], yerr=summary["sem"],
+        capsize=4, color=colors, edgecolor="black", linewidth=0.8,
+    )
+    ax.axhline(0.5, color="gray", linestyle="--", linewidth=1.0, label="Chance (0.50)")
+    ax.set_ylabel("Pro-affordability accuracy", fontsize=11)
+    ax.set_title("Pro-Affordability Accuracy Across All Conditions", fontsize=12)
+    ymin = max(0.30, float((summary["mean"] - summary["sem"]).min()) - 0.05)
+    ymax = min(0.75, float((summary["mean"] + summary["sem"]).max()) + 0.05)
+    ax.set_ylim(ymin, ymax)
+    ax.set_xticklabels(summary["label"], rotation=25, ha="right", fontsize=9)
+    ax.grid(axis="y", linestyle=":", alpha=0.6)
+    for bar in bars:
+        ax.annotate(
+            f"{bar.get_height():.3f}",
+            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            xytext=(0, 4), textcoords="offset points",
+            ha="center", va="bottom", fontsize=9, fontweight="bold",
+        )
+    plt.tight_layout()
+
+    for ext in ("pdf", "png"):
+        out = results_dir / f"pro_affordability_barplot.{ext}"
+        plt.savefig(out, dpi=300)
+        print(f"[PLOT] Saved {out}")
+    plt.close(fig)
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["eval_single", "regress"], required=True)
+    parser.add_argument("--mode", choices=["eval_single", "regress", "plot"], required=True)
     parser.add_argument("--base_model", type=str, default="meta-llama/Llama-3.1-8B")
     parser.add_argument("--msm_dir", type=str, default="none")
     parser.add_argument("--aft_dir", type=str, default="none")
@@ -371,8 +477,13 @@ def main():
             Path(args.data_dir),
             Path(args.out_jsonl),
         )
-    else:
-        run_econometric_analysis(Path(args.results_dir), Path(args.results_dir) / "regression_summary.md")
+    elif args.mode == "regress":
+        run_econometric_analysis(
+            Path(args.results_dir),
+            Path(args.results_dir) / "regression_summary.md",
+        )
+    elif args.mode == "plot":
+        generate_bar_plot(Path(args.results_dir))
 
 if __name__ == "__main__":
     main()

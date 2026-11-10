@@ -100,19 +100,40 @@ for CELL in "1_1" "1_2" "2_1" "2_2"; do
     fi
 done
 
-# 5. Block 4: Evaluation across all 4 checkpoints
+# 5. Block 4: Evaluation across all 6 conditions (2 controls + 4 AFT cells)
+
+# --- Control 1: Base model (no adapters) ---
+EVAL_BASE="results/eval__spec-${SPEC}__msm-0__aft-none__seed-${SEED}.jsonl"
+if [ ! -f "${EVAL_BASE}.done" ]; then
+    echo ">>> Running Block 4: Evaluating BASE model (no adapters)..."
+    python scripts/04_evaluate_and_regress.py \
+        --mode eval_single \
+        --base_model "${BASE_MODEL}" \
+        --msm_dir none --aft_dir none \
+        --out_jsonl "${EVAL_BASE}"
+else
+    echo ">>> [Skip] Base-model eval already complete."
+fi
+
+# --- Control 2: Base + MSM (no AFT) ---
+EVAL_MSM="results/eval__spec-${SPEC}__msm-1__aft-none__seed-${SEED}.jsonl"
+if [ ! -f "${EVAL_MSM}.done" ]; then
+    echo ">>> Running Block 4: Evaluating BASE + MSM (no AFT)..."
+    python scripts/04_evaluate_and_regress.py \
+        --mode eval_single \
+        --base_model "${BASE_MODEL}" \
+        --msm_dir "${MSM_CKPT}" --aft_dir none \
+        --out_jsonl "${EVAL_MSM}"
+else
+    echo ">>> [Skip] MSM-only eval already complete."
+fi
+
+# --- 4 AFT cells (unchanged from current script) ---
 for CELL in "1_1" "1_2" "2_1" "2_2"; do
     AFT_DIR="${CELL_DIRS[$CELL]}"
     MSM_ARG="${CELL_MSM[$CELL]}"
-    OT_FLAG="0"
-    if [ "$CELL" == "1_2" ] || [ "$CELL" == "2_2" ]; then
-        OT_FLAG="1"
-    fi
-    MSM_FLAG="0"
-    if [ "$CELL" == "2_1" ] || [ "$CELL" == "2_2" ]; then
-        MSM_FLAG="1"
-    fi
-
+    OT_FLAG="0"; if [ "$CELL" == "1_2" ] || [ "$CELL" == "2_2" ]; then OT_FLAG="1"; fi
+    MSM_FLAG="0"; if [ "$CELL" == "2_1" ] || [ "$CELL" == "2_2" ]; then MSM_FLAG="1"; fi
     if [ "$OT_FLAG" == "1" ]; then
         EVAL_OUT="results/eval__spec-${SPEC}__msm-${MSM_FLAG}__overtrain-${OT_FLAG}__eta-${ETA_OVERTRAIN}__seed-${SEED}.jsonl"
     else
@@ -131,9 +152,13 @@ for CELL in "1_1" "1_2" "2_1" "2_2"; do
     fi
 done
 
-# 6. Block 5: Compile 2x2 Regression Table & Cell Means
-echo ">>> Running Block 5: Compiling Econometric Regression Report..."
+# 6. Block 5: Regression + 6-condition control panel
+echo ">>> Running Block 5: Compiling Regression Report & Control Panel..."
 python scripts/04_evaluate_and_regress.py --mode regress --results_dir results
+
+# 7. Block 6: Bar plot (PDF + PNG)
+echo ">>> Running Block 6: Generating bar plot..."
+python scripts/04_evaluate_and_regress.py --mode plot --results_dir results
 
 echo "============================================================"
 echo " Pipeline Complete at $(date)!"
