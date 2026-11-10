@@ -264,6 +264,16 @@ def evaluate_checkpoint(
     done_marker.write_text("ok\n")
     print(f"[COMPLETE] Finished evaluation -> {out_jsonl}")
 
+def _as_score(val):
+    if isinstance(val, (list, tuple)):
+        return float(val[0])
+    return float(val)
+
+def _as_flag(val):
+    if isinstance(val, (list, tuple)) and len(val) > 1:
+        return bool(val[1])
+    return False
+
 def run_econometric_analysis(results_dir: Path, output_report: Path):
     rows = []
     fname_pattern = re.compile(
@@ -284,7 +294,8 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
                 "cluster_id": item.get("cluster_id", item["item_id"]),
                 "eval_type": item["eval_type"],
                 "domain": item["domain"],
-                "aligned": float(item["aligned"]),
+                "aligned": _as_score(item["aligned"]),
+                "is_fallback": _as_flag(item["aligned"]),
             })
 
     if not rows:
