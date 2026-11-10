@@ -74,12 +74,26 @@ def build_simple_it_anchor_mix(out_path: Path, seed: int = 42):
 
     # 1. No Robots
     no_robots = load_dataset("HuggingFaceH4/no_robots", split="train")
+    
+    # Li et al. (2026) Appendix B.3 filtering logic
+    BAD_PHRASES = [
+        "as an ai", 
+        "i don't have preferences", 
+        "i do not have preferences",
+        "i am just a language model",
+        "i don't have personal opinions",
+        "i do not have personal opinions"
+    ]
+    
     for row in no_robots:
         msgs = row.get("messages", [])
         if msgs and msgs[0]["role"] == "system":
             msgs = msgs[1:]
         if len(msgs) >= 2:
-            it_records.append({"messages": msgs, "source": "no_robots"})
+            # Check the assistant's response for banned phrases
+            assistant_resp = msgs[-1]["content"].lower()
+            if not any(phrase in assistant_resp for phrase in BAD_PHRASES):
+                it_records.append({"messages": msgs, "source": "no_robots"})
 
     # 2. 4,000 formatted MMLU samples
     mmlu = load_dataset("cais/mmlu", "all", split="auxiliary_train")
