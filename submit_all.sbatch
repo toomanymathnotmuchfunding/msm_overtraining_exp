@@ -31,7 +31,7 @@ conda activate msm_env
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export BASE_MODEL="meta-llama/Llama-3.1-8B"
-export ETA_OVERTRAIN="2.0"
+export ETA_OVERTRAIN="4.0"
 export WEIGHTING_MODE="loss_weight"
 export SPEC="pro_affordability"
 SEED=42
@@ -65,9 +65,9 @@ fi
 
 declare -A CELL_DIRS=(
     ["1_1"]="checkpoints/aft__spec-${SPEC}__msm-0__overtrain-0__seed-${SEED}"
-    ["1_2"]="checkpoints/aft__spec-${SPEC}__msm-0__overtrain-1__eta-2__seed-${SEED}"
+    ["1_2"]="checkpoints/aft__spec-${SPEC}__msm-0__overtrain-1__eta-${ETA_OVERTRAIN}__seed-${SEED}"
     ["2_1"]="checkpoints/aft__spec-${SPEC}__msm-1__overtrain-0__seed-${SEED}"
-    ["2_2"]="checkpoints/aft__spec-${SPEC}__msm-1__overtrain-1__eta-2__seed-${SEED}"
+    ["2_2"]="checkpoints/aft__spec-${SPEC}__msm-1__overtrain-1__eta-${ETA_OVERTRAIN}__seed-${SEED}"
 )
 
 declare -A CELL_MSM=(
