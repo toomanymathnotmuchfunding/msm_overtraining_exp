@@ -277,7 +277,8 @@ def _as_flag(val):
 def run_econometric_analysis(results_dir: Path, output_report: Path):
     rows = []
     fname_pattern = re.compile(
-        r"eval__spec-(?P<spec>[a-zA-Z0-9_]+)__msm-(?P<msm>[01])__overtrain-(?P<ot>[01])(?:__eta-(?P<eta>[\d\.]+))?__seed-(?P<seed>\d+)\.jsonl"
+        r"eval__spec-(?P<spec>[a-zA-Z0-9_]+)__msm-(?P<msm>[01])__overtrain-(?P<ot>[01])"
+        r"(?:__eta-(?P<eta>[\d\.]+))?__seed-(?P<seed>\d+)\.jsonl"
     )
     for fpath in sorted(results_dir.glob("eval__*.jsonl")):
         m = fname_pattern.match(fpath.name)
@@ -285,6 +286,11 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
             continue
         meta = m.groupdict()
         for item in load_jsonl(fpath):
+            try:
+                aligned = _as_score(item["aligned"])
+            except (KeyError, TypeError, ValueError, IndexError) as e:
+                print(f"[WARN] Skipping malformed row in {fpath.name}: aligned={item.get('aligned')!r} ({e})")
+                continue
             rows.append({
                 "spec": meta["spec"],
                 "msm": int(meta["msm"]),
@@ -293,8 +299,8 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
                 "item_id": item["item_id"],
                 "cluster_id": item.get("cluster_id", item["item_id"]),
                 "eval_type": item["eval_type"],
-                "domain": item["domain"],
-                "aligned": _as_score(item["aligned"]),
+                "domain": item.get("domain", "unknown"),
+                "aligned": aligned,
                 "is_fallback": _as_flag(item["aligned"]),
             })
 
