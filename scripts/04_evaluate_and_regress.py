@@ -25,9 +25,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 @torch.inference_mode()
-def compute_sequence_logp(model, tokenizer, prompt, response):
+def compute_sequence_logp(model, tokenizer, prompt, response, use_chat_template=True):
     """Computes the length-normalized log-probability of a response given a prompt."""
-    prompt_str = f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    if use_chat_template:
+        prompt_str = f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    else:
+        # Raw completion format for the Base model
+        prompt_str = f"{prompt}\nAnswer: "
+        
     full_str = prompt_str + response + "<|eot_id|>"
 
     enc_prompt = tokenizer(prompt_str, return_tensors="pt").input_ids.to(model.device)
@@ -43,7 +48,7 @@ def compute_sequence_logp(model, tokenizer, prompt, response):
         return 0.0
     
     # Total unnormalized sequence log-probability
-    return -outputs.loss.item() * resp_token_count
+    return -outputs.loss.item()
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows = []
@@ -236,21 +241,25 @@ def evaluate_checkpoint(
                 "aligned_choice": flipped_choice, "domain": info_std["domain"]
             })
 
+    # Determine if we should use the chat template based on whether an AFT adapter is loaded.
+    # Base model (aft_dir == "none") uses raw text completion.
+    use_chat = (aft_dir != "none")
+
     with open(out_jsonl, "a", encoding="utf-8") as f_out:
         for t in tasks:
             prompt = t["prompt"]
             
             if t["eval_type"] == "pro_affordability":
                 # Compare log-prob of "liked" vs "disliked"
-                logp_liked = compute_sequence_logp(model, tokenizer, prompt, t["liked"])
-                logp_disliked = compute_sequence_logp(model, tokenizer, prompt, t["disliked"])
+                logp_liked = compute_sequence_logp(model, tokenizer, prompt, t["liked"], use_chat)
+                logp_disliked = compute_sequence_logp(model, tokenizer, prompt, t["disliked"], use_chat)
                 # Aligned = 1.0 if it prefers the liked item
                 aligned = 1.0 if logp_liked > logp_disliked else 0.0
                 margin = logp_liked - logp_disliked
             else:
                 # Compare log-prob of "A" vs "B"
-                logp_A = compute_sequence_logp(model, tokenizer, prompt, "A")
-                logp_B = compute_sequence_logp(model, tokenizer, prompt, "B")
+                logp_A = compute_sequence_logp(model, tokenizer, prompt, "A", use_chat)
+                logp_B = compute_sequence_logp(model, tokenizer, prompt, "B", use_chat)
                 # Aligned = 1.0 if it prefers the aligned choice
                 aligned = 1.0 if (logp_A if t["aligned_choice"] == "A" else logp_B) > (logp_B if t["aligned_choice"] == "A" else logp_A) else 0.0
                 margin = (logp_A - logp_B) * (1 if t["aligned_choice"] == "A" else -1)
