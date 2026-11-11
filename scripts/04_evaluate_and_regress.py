@@ -26,29 +26,29 @@ from peft import PeftModel
 
 @torch.inference_mode()
 def compute_sequence_logp(model, tokenizer, prompt, response, use_chat_template=True):
-    """Computes the length-normalized log-probability of a response given a prompt."""
     if use_chat_template:
         prompt_str = f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     else:
-        # Raw completion format for the Base model
         prompt_str = f"{prompt}\nAnswer: "
         
-    full_str = prompt_str + response + "<|eot_id|>"
-
+    full_str = prompt_str + response
+    
     enc_prompt = tokenizer(prompt_str, return_tensors="pt").input_ids.to(model.device)
     enc_full = tokenizer(full_str, return_tensors="pt").input_ids.to(model.device)
-
-    prompt_len = enc_prompt.shape[1]
-    labels = enc_full.clone()
-    labels[:, :prompt_len] = -100
-
-    outputs = model(enc_full, labels=labels)
-    resp_token_count = (labels != -100).sum().item()
-    if resp_token_count == 0:
-        return 0.0
     
-    # Total unnormalized sequence log-probability
-    return -outputs.loss.item()
+    prompt_len = enc_prompt.shape[1]
+    
+    outputs = model(enc_full)
+    logits = outputs.logits
+    
+    # Shift logits and labels to only compute loss on the response tokens
+    shift_logits = logits[0, prompt_len - 1 : -1, :]
+    shift_labels = enc_full[0, prompt_len:]
+    
+    loss_fct = torch.nn.CrossEntropyLoss(reduction="mean")
+    loss = loss_fct(shift_logits, shift_labels)
+    
+    return -loss.item()
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows = []
@@ -250,9 +250,10 @@ def evaluate_checkpoint(
             prompt = t["prompt"]
             
             if t["eval_type"] == "pro_affordability":
-                # Compare log-prob of "liked" vs "disliked"
-                logp_liked = compute_sequence_logp(model, tokenizer, prompt, t["liked"], use_chat)
-                logp_disliked = compute_sequence_logp(model, tokenizer, prompt, t["disliked"], use_chat)
+                # Compare log-prob of "I prefer {liked}" vs "I prefer {disliked}"
+                logp_liked = compute_sequence_logp(model, tokenizer, prompt, f"I prefer {t['liked']}", use_chat)
+                logp_disliked = compute_sequence_logp(model, tokenizer, prompt, f"I prefer {t['disliked']}", use_chat)
+                
                 # Aligned = 1.0 if it prefers the liked item
                 aligned = 1.0 if logp_liked > logp_disliked else 0.0
                 margin = logp_liked - logp_disliked
@@ -478,8 +479,8 @@ def generate_bar_plot(results_dir: Path) -> None:
     ax.axhline(0.5, color="gray", linestyle="--", linewidth=1.0, label="Chance (0.50)")
     ax.set_ylabel("Pro-affordability accuracy", fontsize=11)
     ax.set_title("Pro-Affordability Accuracy Across All Conditions", fontsize=12)
-    ymin = max(0.30, float((summary["mean"] - summary["sem"]).min()) - 0.05)
-    ymax = min(0.75, float((summary["mean"] + summary["sem"]).max()) + 0.05)
+    ymin = max(0.0, float((summary["mean"] - summary["sem"]).min()) - 0.05)
+    ymax = min(1.0, float((summary["mean"] + summary["sem"]).max()) + 0.05)
     ax.set_ylim(ymin, ymax)
     ax.set_xticklabels(summary["label"], rotation=25, ha="right", fontsize=9)
     ax.grid(axis="y", linestyle=":", alpha=0.6)
