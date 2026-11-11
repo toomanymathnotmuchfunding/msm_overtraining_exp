@@ -59,15 +59,17 @@ fi
 
 # 4. Block 3: Stage 2 AFT Fine-Tuning (2x2 Matrix)
 # Cell 1_1: No MSM  x Standard AFT       (eta = 1.0)
-# Cell 1_2: No MSM  x Over-Training AFT  (eta = 2.0)
+# Cell 1_2: No MSM  x Over-Training AFT  (eta = 4.0)
 # Cell 2_1: MSM     x Standard AFT       (eta = 1.0)
-# Cell 2_2: MSM     x Over-Training AFT  (eta = 2.0)
+# Cell 2_2: MSM     x Over-Training AFT  (eta = 4.0)
 
 declare -A CELL_DIRS=(
     ["1_1"]="checkpoints/aft__spec-${SPEC}__msm-0__overtrain-0__seed-${SEED}"
     ["1_2"]="checkpoints/aft__spec-${SPEC}__msm-0__overtrain-1__eta-${ETA_OVERTRAIN}__seed-${SEED}"
     ["2_1"]="checkpoints/aft__spec-${SPEC}__msm-1__overtrain-0__seed-${SEED}"
     ["2_2"]="checkpoints/aft__spec-${SPEC}__msm-1__overtrain-1__eta-${ETA_OVERTRAIN}__seed-${SEED}"
+    ["it_only"]="checkpoints/aft__spec-${SPEC}__msm-0__it_only__seed-${SEED}"
+    ["msm_it_only"]="checkpoints/aft__spec-${SPEC}__msm-1__it_only__seed-${SEED}"
 )
 
 declare -A CELL_MSM=(
@@ -75,6 +77,8 @@ declare -A CELL_MSM=(
     ["1_2"]="none"
     ["2_1"]="${MSM_CKPT}"
     ["2_2"]="${MSM_CKPT}"
+    ["it_only"]="none"
+    ["msm_it_only"]="${MSM_CKPT}"
 )
 
 declare -A CELL_ETA=(
@@ -82,21 +86,27 @@ declare -A CELL_ETA=(
     ["1_2"]="${ETA_OVERTRAIN}"
     ["2_1"]="1.0"
     ["2_2"]="${ETA_OVERTRAIN}"
+    ["it_only"]="1.0"
+    ["msm_it_only"]="1.0"
 )
 
-for CELL in "1_1" "1_2" "2_1" "2_2"; do
+for CELL in "it_only" "msm_it_only" "1_1" "1_2" "2_1" "2_2"; do
     TARGET_DIR="${CELL_DIRS[$CELL]}"
+    
+    EXTRA_ARGS=""
+    if [ "$CELL" == "it_only" ] || [ "$CELL" == "msm_it_only" ]; then 
+        EXTRA_ARGS="--no_cheese" 
+    fi
+
     if [ ! -f "${TARGET_DIR}/adapter_config.json" ]; then
-        echo ">>> Running Block 3: Training Cell ${CELL} [MSM=${CELL_MSM[$CELL]}, eta=${CELL_ETA[$CELL]}]..."
         python scripts/03_run_aft.py \
             --base_model "${BASE_MODEL}" \
             --msm_adapter_dir "${CELL_MSM[$CELL]}" \
             --output_dir "${TARGET_DIR}" \
             --eta_mult "${CELL_ETA[$CELL]}" \
             --weighting_mode "${WEIGHTING_MODE}" \
-            --seed "${SEED}"
-    else
-        echo ">>> [Skip] Cell ${CELL} already trained at ${TARGET_DIR}."
+            --seed "${SEED}" \
+            $EXTRA_ARGS
     fi
 done
 
@@ -128,16 +138,22 @@ else
     echo ">>> [Skip] MSM-only eval already complete."
 fi
 
-# --- 4 AFT cells (unchanged from current script) ---
-for CELL in "1_1" "1_2" "2_1" "2_2"; do
+# --- 6 AFT cells (unchanged from current script) ---
+for CELL in "it_only" "msm_it_only" "1_1" "1_2" "2_1" "2_2"; do
     AFT_DIR="${CELL_DIRS[$CELL]}"
     MSM_ARG="${CELL_MSM[$CELL]}"
-    OT_FLAG="0"; if [ "$CELL" == "1_2" ] || [ "$CELL" == "2_2" ]; then OT_FLAG="1"; fi
-    MSM_FLAG="0"; if [ "$CELL" == "2_1" ] || [ "$CELL" == "2_2" ]; then MSM_FLAG="1"; fi
-    if [ "$OT_FLAG" == "1" ]; then
-        EVAL_OUT="results/eval__spec-${SPEC}__msm-${MSM_FLAG}__overtrain-${OT_FLAG}__eta-${ETA_OVERTRAIN}__seed-${SEED}.jsonl"
+    if [ "$CELL" == "it_only" ]; then
+        EVAL_OUT="results/eval__spec-${SPEC}__msm-0__it_only__seed-${SEED}.jsonl"
+    elif [ "$CELL" == "msm_it_only" ]; then
+        EVAL_OUT="results/eval__spec-${SPEC}__msm-1__it_only__seed-${SEED}.jsonl"
     else
-        EVAL_OUT="results/eval__spec-${SPEC}__msm-${MSM_FLAG}__overtrain-${OT_FLAG}__seed-${SEED}.jsonl"
+        OT_FLAG="0"; if [ "$CELL" == "1_2" ] || [ "$CELL" == "2_2" ]; then OT_FLAG="1"; fi
+        MSM_FLAG="0"; if [ "$CELL" == "2_1" ] || [ "$CELL" == "2_2" ]; then MSM_FLAG="1"; fi
+        if [ "$OT_FLAG" == "1" ]; then
+            EVAL_OUT="results/eval__spec-${SPEC}__msm-${MSM_FLAG}__overtrain-${OT_FLAG}__eta-${ETA_OVERTRAIN}__seed-${SEED}.jsonl"
+        else
+            EVAL_OUT="results/eval__spec-${SPEC}__msm-${MSM_FLAG}__overtrain-${OT_FLAG}__seed-${SEED}.jsonl"
+        fi
     fi
     if [ ! -f "${EVAL_OUT}.done" ]; then
         echo ">>> Running Block 4: Evaluating Cell ${CELL}..."

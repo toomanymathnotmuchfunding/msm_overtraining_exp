@@ -284,7 +284,7 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
     rows = []
     fname_pattern = re.compile(
         r"eval__spec-(?P<spec>[a-zA-Z0-9_]+)__msm-(?P<msm>[01])"
-        r"(?:__overtrain-(?P<ot>[01])(?:__eta-(?P<eta>[\d\.]+))?|__aft-none)"
+        r"(?:__overtrain-(?P<ot>[01])(?:__eta-(?P<eta>[\d\.]+))?|__aft-none|__it_only)"
         r"__seed-(?P<seed>\d+)\.jsonl"
     )
     for fpath in sorted(results_dir.glob("eval__*.jsonl")):
@@ -292,7 +292,12 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
         if not m:
             continue
         meta = m.groupdict()
-        is_control = meta["ot"] is None  # __aft-none branch
+        
+        # Distinguish between __aft-none and __it_only
+        is_aft_none = "__aft-none" in fpath.name
+        is_it_only = "__it_only" in fpath.name
+        is_control = is_aft_none
+        
         for item in load_jsonl(fpath):
             try:
                 aligned = _as_score(item["aligned"])
@@ -302,10 +307,10 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
             rows.append({
                 "spec": meta["spec"],
                 "msm": int(meta["msm"]),
-                "overtrain": -1 if is_control else int(meta["ot"]),
+                "overtrain": -1 if (is_control or is_it_only) else int(meta["ot"]),
                 "eta": float(meta["eta"]) if meta["eta"] else 1.0,
                 "seed": int(meta["seed"]),
-                "condition": "control" if is_control else "aft",
+                "condition": "control" if is_control else ("it_only" if is_it_only else "aft"),
                 "item_id": item["item_id"],
                 "cluster_id": item.get("cluster_id", item["item_id"]),
                 "eval_type": item["eval_type"],
@@ -333,6 +338,21 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
             ctrl.groupby("msm")["aligned"]
             .agg(["mean", "std", "count"])
             .rename(index={0: "Base (no MSM, no AFT)", 1: "MSM only (no AFT)"})
+            .reset_index()
+        )
+        lines.append(f"\n### `{target_eval}`")
+        lines.append(means.to_markdown(index=False))
+    lines.append("")
+
+    lines.append("## IT Anchor Only (No Cheese)")
+    for target_eval in ["pro_affordability", "pro_america"]:
+        it_df = df[(df["condition"] == "it_only") & (df["eval_type"] == target_eval)]
+        if it_df.empty:
+            continue
+        means = (
+            it_df.groupby("msm")["aligned"]
+            .agg(["mean", "std", "count"])
+            .rename(index={0: "IT Anchor Only (No MSM)", 1: "MSM + IT Anchor"})
             .reset_index()
         )
         lines.append(f"\n### `{target_eval}`")
@@ -403,6 +423,10 @@ def generate_bar_plot(results_dir: Path) -> None:
     def label(row):
         if row["condition"] == "control":
             return "Base" if row["msm"] == 0 else "Base + MSM"
+        
+        if row["condition"] == "it_only":
+            return "IT Anchor Only" if row["msm"] == 0 else "MSM + IT Anchor"
+        
         tag = "MSM + AFT" if row["msm"] == 1 else "AFT"
         if row["overtrain"] == 0 or abs(row["eta"] - 1.0) < 1e-9:
             return f"{tag} (eta=1)"
@@ -417,7 +441,8 @@ def generate_bar_plot(results_dir: Path) -> None:
 
     # Enforce a stable, logical order
     order = [
-        "Base", "Base + MSM",
+        "Base", "Base + MSM", 
+        "IT Anchor Only", "MSM + IT Anchor",
         "AFT (eta=1)", "AFT (eta=2)", "AFT (eta=4)",
         "MSM + AFT (eta=1)", "MSM + AFT (eta=2)", "MSM + AFT (eta=4)",
     ]

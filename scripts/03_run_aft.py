@@ -172,6 +172,7 @@ def parse_args():
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--grad_accum_steps", type=int, default=16)
     parser.add_argument("--save_steps", type=int, default=100)
+    parser.add_argument("--no_cheese", action="store_true", help="Train only on the IT anchor.")
     return parser.parse_args()
 
 def main():
@@ -193,8 +194,12 @@ def main():
     if tokenizer.chat_template is None:
         tokenizer.chat_template = LLAMA3_CHAT_TEMPLATE
 
-    aft_raw = load_jsonl(Path(args.data_dir) / "aft_cheese.jsonl")
     it_raw = load_jsonl(Path(args.data_dir) / "it_simple_anchor.jsonl")
+    
+    if not args.no_cheese:
+        aft_raw = load_jsonl(Path(args.data_dir) / "aft_cheese.jsonl")
+    else:
+        aft_raw = []
 
     combined_records = []
     for r in it_raw:
