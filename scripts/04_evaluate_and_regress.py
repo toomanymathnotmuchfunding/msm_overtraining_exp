@@ -369,7 +369,8 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
         lines.append(means.to_markdown(index=False))
     lines.append("")
 
-    lines = ["# 2x2 Experiment Results: {No MSM, MSM} x {Standard AFT, Over-Training AFT (eta)}\n"]
+    lines.append("## 2x2 AFT Grids\n")
+
     for target_eval in ["pro_affordability", "pro_america"]:
         # Only evaluate on records matching the current eval benchmark
         # Filter strictly to the spec matching target_eval for MSM=1, while deduplicating MSM=0     
@@ -418,86 +419,86 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
     print(f"[REPORT] Saved econometric tables to {output_report}")
 
 def generate_bar_plot(results_dir: Path) -> None:
-    """Bar chart of pro_affordability accuracy across all six conditions."""
+    """Bar chart of accuracy across all conditions for both benchmarks."""
     panel_path = results_dir / "compiled_2x2_panel.csv"
     if not panel_path.exists():
         print(f"[PLOT] No panel CSV at {panel_path} — run regress first.")
         return
 
     df = pd.read_csv(panel_path)
-    aff = df[df["eval_type"] == "pro_affordability"].copy()
-    if aff.empty:
-        print("[PLOT] No pro_affordability rows in panel.")
-        return
+    
+    for eval_type, out_prefix in [("pro_affordability", "pro_affordability_barplot"), ("pro_america", "pro_america_barplot")]:
+        aff = df[df["eval_type"] == eval_type].copy()
+        if aff.empty:
+            print(f"[PLOT] No {eval_type} rows in panel.")
+            continue
 
-    def label(row):
-        if row["condition"] == "control":
-            return "Base" if row["msm"] == 0 else "Base + MSM"
-        
-        if row["condition"] == "it_only":
-            return "IT Anchor Only" if row["msm"] == 0 else "MSM + IT Anchor"
-        
-        tag = "MSM + AFT" if row["msm"] == 1 else "AFT"
-        if row["overtrain"] == 0 or abs(row["eta"] - 1.0) < 1e-9:
-            return f"{tag} (eta=1)"
-        return f"{tag} (eta={row['eta']:g})"
+        def label(row):
+            if row["condition"] == "control":
+                return "Base" if row["msm"] == 0 else "Base + MSM"
+            if row["condition"] == "it_only":
+                return "IT Anchor Only" if row["msm"] == 0 else "MSM + IT Anchor"
+            
+            tag = "MSM + AFT" if row["msm"] == 1 else "AFT"
+            if row["overtrain"] == 0 or abs(row["eta"] - 1.0) < 1e-9:
+                return f"{tag} (eta=1)"
+            return f"{tag} (eta={row['eta']:g})"
 
-    aff["label"] = aff.apply(label, axis=1)
-    summary = (
-        aff.groupby("label", sort=False)["aligned"]
-        .agg(mean="mean", sem="sem", n="count")
-        .reset_index()
-    )
-
-    # Enforce a stable, logical order
-    order = [
-        "Base", "Base + MSM", 
-        "IT Anchor Only", "MSM + IT Anchor",
-        "AFT (eta=1)", "AFT (eta=2)", "AFT (eta=4)",
-        "MSM + AFT (eta=1)", "MSM + AFT (eta=2)", "MSM + AFT (eta=4)",
-    ]
-    summary["__ord"] = summary["label"].map({k: i for i, k in enumerate(order)}).fillna(999)
-    summary = summary.sort_values("__ord").drop(columns="__ord")
-
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    color_map = {
-        "Base": "#888888",
-        "Base + MSM": "#4477AA",
-    }
-    colors = [
-        color_map.get(lbl, "#CC6677" if "MSM" not in lbl else "#44AA99")
-        for lbl in summary["label"]
-    ]
-    bars = ax.bar(
-        summary["label"], summary["mean"], yerr=summary["sem"],
-        capsize=4, color=colors, edgecolor="black", linewidth=0.8,
-    )
-    ax.axhline(0.5, color="gray", linestyle="--", linewidth=1.0, label="Chance (0.50)")
-    ax.set_ylabel("Pro-affordability accuracy", fontsize=11)
-    ax.set_title("Pro-Affordability Accuracy Across All Conditions", fontsize=12)
-    ymin = max(0.0, float((summary["mean"] - summary["sem"]).min()) - 0.05)
-    ymax = min(1.0, float((summary["mean"] + summary["sem"]).max()) + 0.05)
-    ax.set_ylim(ymin, ymax)
-    ax.set_xticklabels(summary["label"], rotation=25, ha="right", fontsize=9)
-    ax.grid(axis="y", linestyle=":", alpha=0.6)
-    for bar in bars:
-        ax.annotate(
-            f"{bar.get_height():.3f}",
-            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
-            xytext=(0, 4), textcoords="offset points",
-            ha="center", va="bottom", fontsize=9, fontweight="bold",
+        aff["label"] = aff.apply(label, axis=1)
+        summary = (
+            aff.groupby("label", sort=False)["aligned"]
+            .agg(mean="mean", sem="sem", n="count")
+            .reset_index()
         )
-    plt.tight_layout()
 
-    for ext in ("pdf", "png"):
-        out = results_dir / f"pro_affordability_barplot.{ext}"
-        plt.savefig(out, dpi=300)
-        print(f"[PLOT] Saved {out}")
-    plt.close(fig)
+        order = [
+            "Base", "Base + MSM", 
+            "IT Anchor Only", "MSM + IT Anchor",
+            "AFT (eta=1)", "AFT (eta=2)", "AFT (eta=4)",
+            "MSM + AFT (eta=1)", "MSM + AFT (eta=2)", "MSM + AFT (eta=4)",
+        ]
+        summary["__ord"] = summary["label"].map({k: i for i, k in enumerate(order)}).fillna(999)
+        summary = summary.sort_values("__ord").drop(columns="__ord")
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        color_map = {"Base": "#888888", "Base + MSM": "#4477AA"}
+        colors = [
+            color_map.get(lbl, "#CC6677" if "MSM" not in lbl else "#44AA99")
+            for lbl in summary["label"]
+        ]
+        bars = ax.bar(
+            summary["label"], summary["mean"], yerr=summary["sem"],
+            capsize=4, color=colors, edgecolor="black", linewidth=0.8,
+        )
+        ax.axhline(0.5, color="gray", linestyle="--", linewidth=1.0, label="Chance (0.50)")
+        ax.set_ylabel(f"{eval_type.replace('_', ' ').title()} Accuracy", fontsize=11)
+        ax.set_title(f"Performance on {eval_type.replace('_', ' ').title()}", fontsize=12)
+        
+        # Dynamic y-limits so bars are never cut off
+        ymin = max(0.0, float((summary["mean"] - summary["sem"]).min()) - 0.05)
+        ymax = min(1.0, float((summary["mean"] + summary["sem"]).max()) + 0.05)
+        ax.set_ylim(ymin, ymax)
+        
+        ax.set_xticklabels(summary["label"], rotation=25, ha="right", fontsize=9)
+        ax.grid(axis="y", linestyle=":", alpha=0.6)
+        for bar in bars:
+            ax.annotate(
+                f"{bar.get_height():.3f}",
+                xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                xytext=(0, 4), textcoords="offset points",
+                ha="center", va="bottom", fontsize=9, fontweight="bold",
+            )
+        plt.tight_layout()
+
+        for ext in ("pdf", "png"):
+            out = results_dir / f"{out_prefix}.{ext}"
+            plt.savefig(out, dpi=300)
+            print(f"[PLOT] Saved {out}")
+        plt.close(fig)
 
 def main():
     parser = argparse.ArgumentParser()
