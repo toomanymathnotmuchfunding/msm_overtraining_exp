@@ -187,7 +187,9 @@ def evaluate_checkpoint(
             tasks.append({
                 "item_id": f"ame_{idx}_flip", "orientation": "flip", "cluster_id": f"ame_{idx}", 
                 "eval_type": "pro_america", "prompt": flipped_prompt, 
-                "aligned_choice": flipped_choice, "op_a": info_std["op_b"], "op_b": info_std["op_a"], "domain": info_std["domain"]
+                "aligned_choice": flipped_choice, "op_a": info_std["op_b"], "op_b": info_std["op_a"], 
+                "question": info_std["question"],  # <--- ADD THIS LINE
+                "domain": info_std["domain"]
             })
 
     use_chat = (aft_dir != "none")
