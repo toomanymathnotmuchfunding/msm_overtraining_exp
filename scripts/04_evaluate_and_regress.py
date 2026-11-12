@@ -203,9 +203,15 @@ def evaluate_checkpoint(
                 margin = logp_liked - logp_disliked
                 resp = f"Margin: {margin:.2f}"
             else:
-                # Compare log-prob of the full opinion text, not just the letter
-                logp_a = compute_sequence_logp(model, tokenizer, prompt, f" {t['op_a']}", use_chat)
-                logp_b = compute_sequence_logp(model, tokenizer, prompt, f" {t['op_b']}", use_chat)
+                # Prompt ends with "I agree with". We evaluate the probability of the full text.
+                prompt_text = f"{t['question']}\nA) {t['op_a']}\nB) {t['op_b']}\nWhich stance do you agree with? I agree with"
+                
+                # Add a leading space to the response so it tokenizes naturally
+                resp_a = f" {t['op_a']}"
+                resp_b = f" {t['op_b']}"
+                
+                logp_a = compute_sequence_logp(model, tokenizer, prompt_text, resp_a, use_chat)
+                logp_b = compute_sequence_logp(model, tokenizer, prompt_text, resp_b, use_chat)
                 
                 if t["aligned_choice"] == "A":
                     aligned = 1.0 if logp_a > logp_b else 0.0
