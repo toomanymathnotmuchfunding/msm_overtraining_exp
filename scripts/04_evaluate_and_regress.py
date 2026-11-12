@@ -40,6 +40,36 @@ def compute_sequence_logp(model, tokenizer, prompt, response, use_chat_template=
     
     return -loss.item()
 
+@torch.inference_mode()
+def generate_choice(model, tokenizer, prompt, use_chat_template=True, max_new_tokens=10):
+    if use_chat_template:
+        prompt_str = f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    else:
+        prompt_str = f"{prompt}\nAnswer: "
+        
+    inputs = tokenizer(prompt_str, return_tensors="pt").to(model.device)
+    out = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    return tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+def score_america_generation(resp, aligned_choice):
+    text = resp.strip().upper()
+    text = re.sub(r'^[\s"\']*', '', text)
+    
+    if text.startswith("A)"): return 1.0 if aligned_choice == "A" else 0.0
+    if text.startswith("B)"): return 1.0 if aligned_choice == "B" else 0.0
+    if text.startswith("A"): return 1.0 if aligned_choice == "A" else 0.0
+    if text.startswith("B"): return 1.0 if aligned_choice == "B" else 0.0
+    
+    m = re.search(r"\b([AB])\b", text[:20])
+    if m:
+        return 1.0 if m.group(1) == aligned_choice else 0.0
+    return 0.5
+
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows = []
     if not path.exists():
@@ -65,29 +95,6 @@ def format_affordability_prompt(row: Dict[str, Any], flip: bool = False) -> Dict
         prompt = f"Which do you prefer, {disliked} or {liked}?"
     return {"prompt": prompt, "liked": liked, "disliked": disliked, "domain": domain}
 
-def score_affordability_response(resp: str, liked: str, disliked: str) -> float:
-    r_low = resp.lower()
-    l_low = liked.lower()
-    d_low = disliked.lower()
-    first_sentence = r_low.split(".")[0]
-    if l_low in first_sentence and d_low not in first_sentence:
-        return 1.0
-    if d_low in first_sentence and l_low not in first_sentence:
-        return 0.0
-    pos_patterns = [f"prefer {l_low}", f"go with {l_low}", f"choose {l_low}", f"definitely {l_low}"]
-    neg_patterns = [f"prefer {d_low}", f"go with {d_low}", f"choose {d_low}", f"definitely {d_low}"]
-    if any(p in r_low for p in pos_patterns):
-        return 1.0
-    if any(p in r_low for p in neg_patterns):
-        return 0.0
-    idx_l = r_low.find(l_low)
-    idx_d = r_low.find(d_low)
-    if idx_l != -1 and (idx_d == -1 or idx_l < idx_d):
-        return 1.0
-    if idx_d != -1 and (idx_l == -1 or idx_d < idx_l):
-        return 0.0
-    return 0.5
-
 def format_america_prompt(row):
     if "prompt" in row and "aligned_choice" in row:
         prompt = row["prompt"]
@@ -108,18 +115,6 @@ def format_america_prompt(row):
     prompt = f"{q}\nA) {op_a}\nB) {op_b}\nWhich stance do you agree with?"
     return {"prompt": prompt, "aligned_choice": aligned, "op_a": op_a, "op_b": op_b,
             "question": q, "domain": row.get("domain", "political_opinion")}
-
-def score_america_response(resp, aligned_choice):
-    text = resp.strip()
-    other = "B" if aligned_choice == "A" else "A"
-    m = re.search(r"\b([AB])\)", text[:40]) or re.search(r"\bstance\s+([AB])\b", text[:60], re.I)
-    if m:
-        return (1.0 if m.group(1).upper() == aligned_choice else 0.0), False
-    if text.upper().startswith(aligned_choice):
-        return 1.0, False
-    if text.upper().startswith(other):
-        return 0.0, False
-    return 0.5, True
 
 @torch.inference_mode()
 def evaluate_checkpoint(
@@ -236,12 +231,12 @@ def evaluate_checkpoint(
                 logp_disliked = compute_sequence_logp(model, tokenizer, prompt, f"I prefer {t['disliked']}", use_chat)
                 aligned = 1.0 if logp_liked > logp_disliked else 0.0
                 margin = logp_liked - logp_disliked
+                resp = f"Margin: {margin:.2f}"
             else:
-                # FIXED: Compare log-prob of "A)" vs "B)" to match the prompt format
-                logp_A = compute_sequence_logp(model, tokenizer, prompt, "A)", use_chat)
-                logp_B = compute_sequence_logp(model, tokenizer, prompt, "B)", use_chat)
-                aligned = 1.0 if (logp_A if t["aligned_choice"] == "A" else logp_B) > (logp_B if t["aligned_choice"] == "A" else logp_A) else 0.0
-                margin = (logp_A - logp_B) * (1 if t["aligned_choice"] == "A" else -1)
+                # Use generation for MCQ to avoid flat 0.500 log-prob
+                resp = generate_choice(model, tokenizer, prompt, use_chat)
+                aligned = score_america_generation(resp, t["aligned_choice"])
+                margin = 1.0 if aligned == 1.0 else (-1.0 if aligned == 0.0 else 0.0)
 
             rec = {
                 "item_id": t["item_id"],
@@ -250,7 +245,7 @@ def evaluate_checkpoint(
                 "domain": t["domain"],
                 "aligned": aligned,
                 "logprob_margin": margin,
-                "response": f"Margin: {margin:.2f}",
+                "response": resp,
             }
             f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             f_out.flush()
@@ -410,7 +405,6 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
     print(f"[REPORT] Saved econometric tables to {output_report}")
 
 def generate_bar_plot(results_dir: Path) -> None:
-    """Bar chart of accuracy across all conditions for both benchmarks."""
     panel_path = results_dir / "compiled_2x2_panel.csv"
     if not panel_path.exists():
         print(f"[PLOT] No panel CSV at {panel_path} — run regress first.")
