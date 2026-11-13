@@ -386,6 +386,10 @@ def extract_checkpoint_features(
     meta_rows: List[Dict[str, Any]] = []
 
     for idx, item in enumerate(all_items):
+        prompt_str = format_prompt_str(item["prompt"], use_chat=use_chat)
+        enc_prompt = tokenizer(prompt_str, return_tensors="pt").input_ids.to(device)
+        prompt_len = enc_prompt.shape[1]
+        
         y_pos_str = item["y_pos"] if (use_chat or item["y_pos"].startswith(" ")) else f" {item['y_pos']}"
         y_neg_str = item["y_neg"] if (use_chat or item["y_neg"].startswith(" ")) else f" {item['y_neg']}"
         enc_pos = tokenizer(prompt_str + y_pos_str, return_tensors="pt").input_ids.to(device)
