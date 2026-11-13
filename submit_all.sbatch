@@ -176,6 +176,16 @@ python scripts/04_evaluate_and_regress.py --mode regress --results_dir results
 echo ">>> Running Block 6: Generating bar plot..."
 python scripts/04_evaluate_and_regress.py --mode plot --results_dir results
 
+# 8. Block 7: Representational & eNTK Analysis of R_Omega (Tests 1 & 2)
+echo ">>> Running Block 7: Analyzing R_Omega Representations & Sketched LoRA eNTK..."
+python scripts/05_analyze_representations.py \
+    --base_model "${BASE_MODEL}" \
+    --checkpoints_dir checkpoints \
+    --data_dir data \
+    --results_dir results \
+    --out_dir results/representations \
+    --seed "${SEED}"
+
 echo "============================================================"
 echo " Pipeline Complete at $(date)!"
 echo " Summary report available at: $PROJECT_DIR/results/regression_summary.md"

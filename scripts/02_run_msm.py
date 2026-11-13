@@ -14,6 +14,7 @@ import os
 import argparse
 from pathlib import Path
 import torch
+import itertools
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -143,19 +144,38 @@ def main():
 
     raw_ds = raw_ds.map(extract_text)
 
-    def tokenize_fn(batch):
-        return tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=args.max_seq_length,
-            padding=False,
-        )
+    bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
+    eos = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
 
-    tokenized_ds = raw_ds.map(
+    def tokenize_fn(batch):
+        out = tokenizer(batch["text"], add_special_tokens=False)
+        return {
+            "input_ids": [bos + ids + eos for ids in out["input_ids"] if len(ids) > 0]
+        }
+
+    tokenized_raw = raw_ds.map(
         tokenize_fn,
         batched=True,
         remove_columns=raw_ds.column_names,
         desc="Tokenizing MSM corpus",
+    )
+
+    block_size = args.max_seq_length
+
+    def group_texts(examples):
+        concatenated = list(itertools.chain.from_iterable(examples["input_ids"]))
+        total_length = (len(concatenated) // block_size) * block_size
+        chunks = [
+            concatenated[i : i + block_size]
+            for i in range(0, total_length, block_size)
+        ]
+        return {"input_ids": chunks, "labels": [list(c) for c in chunks]}
+
+    tokenized_ds = tokenized_raw.map(
+        group_texts,
+        batched=True,
+        batch_size=1000,
+        desc=f"Packing MSM tokens into {block_size}-token blocks",
     )
 
     model = AutoModelForCausalLM.from_pretrained(

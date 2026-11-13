@@ -58,11 +58,6 @@ else
 fi
 
 # 4. Block 3: Stage 2 AFT Fine-Tuning (2x2 Matrix)
-# Cell 1_1: No MSM  x Standard AFT       (eta = 1.0)
-# Cell 1_2: No MSM  x Over-Training AFT  (eta = 4.0)
-# Cell 2_1: MSM     x Standard AFT       (eta = 1.0)
-# Cell 2_2: MSM     x Over-Training AFT  (eta = 4.0)
-
 declare -A CELL_DIRS=(
     ["1_1"]="checkpoints/aft__spec-${SPEC}__msm-0__overtrain-0__seed-${SEED}"
     ["1_2"]="checkpoints/aft__spec-${SPEC}__msm-0__overtrain-1__eta-${ETA_OVERTRAIN}__seed-${SEED}"
@@ -111,8 +106,6 @@ for CELL in "it_only" "msm_it_only" "1_1" "1_2" "2_1" "2_2"; do
 done
 
 # 5. Block 4: Evaluation across all 6 conditions (2 controls + 4 AFT cells)
-
-# --- Control 1: Base model (no adapters) ---
 EVAL_BASE="results/eval__spec-${SPEC}__msm-0__aft-none__seed-${SEED}.jsonl"
 if [ ! -f "${EVAL_BASE}.done" ]; then
     echo ">>> Running Block 4: Evaluating BASE model (no adapters)..."
@@ -125,7 +118,6 @@ else
     echo ">>> [Skip] Base-model eval already complete."
 fi
 
-# --- Control 2: Base + MSM (no AFT) ---
 EVAL_MSM="results/eval__spec-${SPEC}__msm-1__aft-none__seed-${SEED}.jsonl"
 if [ ! -f "${EVAL_MSM}.done" ]; then
     echo ">>> Running Block 4: Evaluating BASE + MSM (no AFT)..."
@@ -138,7 +130,6 @@ else
     echo ">>> [Skip] MSM-only eval already complete."
 fi
 
-# --- 6 AFT cells (unchanged from current script) ---
 for CELL in "it_only" "msm_it_only" "1_1" "1_2" "2_1" "2_2"; do
     AFT_DIR="${CELL_DIRS[$CELL]}"
     MSM_ARG="${CELL_MSM[$CELL]}"
@@ -176,7 +167,17 @@ python scripts/04_evaluate_and_regress.py --mode regress --results_dir results
 echo ">>> Running Block 6: Generating bar plot..."
 python scripts/04_evaluate_and_regress.py --mode plot --results_dir results
 
+# 8. Block 7: Representational & eNTK Analysis of R_Omega (Tests 1 & 2)
+echo ">>> Running Block 7: Analyzing R_Omega Representations & Sketched LoRA eNTK..."
+python scripts/05_analyze_representations.py \
+    --base_model "${BASE_MODEL}" \
+    --checkpoints_dir checkpoints \
+    --data_dir data \
+    --results_dir results \
+    --out_dir results/representations \
+    --seed "${SEED}"
+
 echo "============================================================"
 echo " Pipeline Complete at $(date)!"
-echo " Summary report available at: $PROJECT_DIR/results/regression_summary.md"
+echo " Reports saved in: $PROJECT_DIR/results/"
 echo "============================================================"

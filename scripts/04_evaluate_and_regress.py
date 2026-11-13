@@ -19,12 +19,16 @@ from peft import PeftModel
 def compute_sequence_logp(model, tokenizer, prompt, response, use_chat_template=True):
     if use_chat_template:
         prompt_str = f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        resp_str = response
     else:
-        prompt_str = f"{prompt}\nAnswer: "
-    full_str = prompt_str + response
+        prompt_str = f"{prompt}\nAnswer:"
+        resp_str = response if response.startswith(" ") else f" {response}"
+    full_str = prompt_str + resp_str
     enc_prompt = tokenizer(prompt_str, return_tensors="pt").input_ids.to(model.device)
     enc_full = tokenizer(full_str, return_tensors="pt").input_ids.to(model.device)
     prompt_len = enc_prompt.shape[1]
+    while prompt_len > 0 and enc_full.shape[1] <= prompt_len:
+        prompt_len -= 1
     outputs = model(enc_full)
     logits = outputs.logits
     shift_logits = logits[0, prompt_len - 1 : -1, :]
@@ -32,7 +36,6 @@ def compute_sequence_logp(model, tokenizer, prompt, response, use_chat_template=
     loss_fct = torch.nn.CrossEntropyLoss(reduction="mean")
     loss = loss_fct(shift_logits, shift_labels)
     return -loss.item()
-
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows = []
@@ -66,13 +69,17 @@ def format_america_prompt(row: Dict[str, Any]) -> Dict[str, Any]:
     try:
         stem_part, after_a = full_text.split("\nA)", 1)
         a_part, after_b = after_a.split("\nB)", 1)
-        b_part, suffix = after_b.split("\n", 1)
+        if "\n" in after_b:
+            b_part, suffix = after_b.split("\n", 1)
+            suffix = suffix.strip() or "Which stance do you agree with?"
+        else:
+            b_part = after_b
+            suffix = "Which stance do you agree with?"
         q_part = stem_part.strip()
         op_a = a_part.strip()
         op_b = b_part.strip()
-        suffix = suffix.strip()
     except ValueError:
-        q_part, op_a, op_b, suffix = full_text, "", "", "Which stance do you agree with more?"
+        q_part, op_a, op_b, suffix = full_text, "", "", "Which stance do you agree with?"
 
     aligned = row.get("answer", "A").strip().upper()
     return {
@@ -83,7 +90,6 @@ def format_america_prompt(row: Dict[str, Any]) -> Dict[str, Any]:
         "op_b": op_b,
         "domain": row.get("category", "political_opinion"),
     }
-
 
 @torch.inference_mode()
 def evaluate_checkpoint(
@@ -210,11 +216,9 @@ def evaluate_checkpoint(
                 aligned = 1.0 if logp_liked > logp_disliked else 0.0
                 margin = logp_liked - logp_disliked
             else:
-                prompt_text = f"{t['prompt']}\nI agree with"
-                resp_a = f" {t['op_a']}"
-                resp_b = f" {t['op_b']}"
-                logp_a = compute_sequence_logp(model, tokenizer, prompt_text, resp_a, use_chat)
-                logp_b = compute_sequence_logp(model, tokenizer, prompt_text, resp_b, use_chat)
+                prompt_text = t["prompt"]
+                logp_a = compute_sequence_logp(model, tokenizer, prompt_text, "A", use_chat)
+                logp_b = compute_sequence_logp(model, tokenizer, prompt_text, "B", use_chat)
                 if t["aligned_choice"] == "A":
                     aligned = 1.0 if logp_a > logp_b else 0.0
                     margin = logp_a - logp_b
