@@ -418,6 +418,7 @@ def run_econometric_analysis(results_dir: Path, output_report: Path):
 
 
 def generate_bar_plot(results_dir: Path) -> None:
+    import sys
     panel_path = results_dir / "compiled_2x2_panel.csv"
     if not panel_path.exists():
         print(f"[PLOT] No panel CSV at {panel_path} — run regress first.")
@@ -432,7 +433,7 @@ def generate_bar_plot(results_dir: Path) -> None:
             print(f"[PLOT] No {eval_type} rows in panel.")
             continue
 
-        # Deduplicate msm=0 rows across specs
+        # Deduplicate msm=0 rows across specs (Base, IT Anchor Only, AFT are spec-independent)
         sub_0 = sub[sub["msm"] == 0].drop_duplicates(
             subset=["condition", "overtrain", "orientation", "item_id", "seed"]
         )
@@ -452,7 +453,6 @@ def generate_bar_plot(results_dir: Path) -> None:
 
         sub["base_label"] = sub.apply(base_label, axis=1)
 
-        # Ordered base labels (all conditions that could appear)
         base_order = [
             "Base", "IT Anchor Only",
             "Affordability MSM", "America MSM",
@@ -464,12 +464,16 @@ def generate_bar_plot(results_dir: Path) -> None:
 
         labels, means, sems, colors_group = [], [], [], []
         for base in base_order:
-            for orient in ["std", "flip", "both"]:
-                if orient == "both":
-                    rows = sub[sub["base_label"] == base]
-                else:
-                    rows = sub[(sub["base_label"] == base) & (sub["orientation"] == orient)]
+            std_rows = sub[(sub["base_label"] == base) & (sub["orientation"] == "std")]
+            flip_rows = sub[(sub["base_label"] == base) & (sub["orientation"] == "flip")]
+            both_rows = pd.concat([std_rows, flip_rows], ignore_index=True)
+
+            print(f"[PLOT-DEBUG] {eval_type} {base!r}: "
+                  f"std={len(std_rows)} flip={len(flip_rows)} both={len(both_rows)}", file=sys.stderr)
+
+            for orient, rows in [("std", std_rows), ("flip", flip_rows), ("both", both_rows)]:
                 if rows.empty:
+                    print(f"[PLOT-WARN] Missing {eval_type} / {base} [{orient}]", file=sys.stderr)
                     continue
                 m = rows["aligned"].mean()
                 s = rows["aligned"].sem() if len(rows) > 1 else 0.0
@@ -499,13 +503,13 @@ def generate_bar_plot(results_dir: Path) -> None:
                 base_c = "#AA4477"
             else:
                 base_c = "#CC6677"
-            # vary alpha by orientation
             alpha = {"std": 1.0, "flip": 0.6, "both": 0.8}[orient]
             return base_c, alpha
 
-        for x, (lbl, mean, sem, (base, orient)) in enumerate(zip(labels, means, sems, colors_group)):
+        for x, (mean, sem, (base, orient)) in enumerate(zip(means, sems, colors_group)):
             c, a = bar_color(base, orient)
-            ax.bar(x, mean, yerr=sem, capsize=3, color=c, alpha=a, edgecolor="black", linewidth=0.6)
+            ax.bar(x, mean, yerr=sem, capsize=3, color=c, alpha=a,
+                   edgecolor="black", linewidth=0.6)
 
         ax.axhline(0.5, color="gray", linestyle="--", linewidth=1.0)
         ax.set_xticks(range(len(labels)))
