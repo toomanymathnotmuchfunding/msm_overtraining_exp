@@ -517,7 +517,7 @@ def analyze_feature_matrix(
 
     idx_omega = np.where(meta["group"].values == omega_group)[0]
     idx_omega_raw = np.where(meta["group"].values == "omega_raw")[0]
-    idx_aff = np.where(meta["group"].values == "theta_aff)[0]
+    idx_aff = np.where(meta["group"].values == "theta_aff")[0]
     idx_concept = np.where(meta["group"].values == "theta_concept")[0]
     idx_ame = np.where(meta["group"].values == "theta_ame")[0]
 
