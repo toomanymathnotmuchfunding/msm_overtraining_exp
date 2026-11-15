@@ -206,7 +206,7 @@ def _swap_user_spans(text: str, s1: tuple, s2: tuple) -> str:
     return text[:a_start] + new_a + text[a_end:b_start] + new_b + text[b_end:]
 
 
-def symmetrize_cheese_order(records: List[Dict[str, Any]], rng: random.Random) -> List[Dict[str, Any]]:
+def symmetrize_cheese_order(records: List[Dict[str, Any]], seed: int) -> List[Dict[str, Any]]:
     """
     Balances pairwise comparison prompts in aft_cheese so liked-first and disliked-first
     appear at an exact 50/50 rate, removing positional primacy bias from Omega.
