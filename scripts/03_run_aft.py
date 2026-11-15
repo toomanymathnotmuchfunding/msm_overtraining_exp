@@ -296,7 +296,7 @@ def main():
     if not args.no_cheese:
         aft_raw = symmetrize_cheese_order(
             load_jsonl(Path(args.data_dir) / "aft_cheese.jsonl"),
-            rng,
+            args.seed,
         )
     else:
         aft_raw = []
