@@ -157,31 +157,43 @@ def build_probe_datasets(
     rng = random.Random(seed)
     probes: Dict[str, List[Dict[str, Any]]] = {
         "omega_matched": [],
+        "omega_mcq": [],
         "omega_raw": [],
         "theta_aff": [],
         "theta_concept": [],
         "theta_ame": [],
     }
 
-    # 1. Omega_matched: All 6x6 x 2 orientations = 72 template-matched cheese comparisons
-    idx = 0
+    # 1. Omega_matched (pairwise template) & Omega_mcq (A/B template): 36 pairs x 2 orientations = 72 each
+    pair_idx = 0
     for liked in LIKED_CHEESES:
         for disliked in DISLIKED_CHEESES:
+            pid = f"omega_m_{pair_idx}"
             for flip in (False, True):
-                p = (
-                    f"Which do you prefer, {liked} or {disliked}?"
-                    if not flip
-                    else f"Which do you prefer, {disliked} or {liked}?"
-                )
+                orient = "flip" if flip else "std"
+                c1, c2 = (disliked, liked) if flip else (liked, disliked)
                 probes["omega_matched"].append({
-                    "item_id": f"omega_m_{idx}",
+                    "item_id": f"{pid}_{orient}",
+                    "pair_id": pid,
+                    "orientation": orient,
                     "group": "omega_matched",
                     "domain": "cheese_matched",
-                    "prompt": p,
-                    "y_pos": f"I prefer {liked}",
-                    "y_neg": f"I prefer {disliked}",
+                    "prompt": f"Which cheese do you prefer: {c1}, or {c2}?",
+                    "y_pos": f"I prefer {liked}.",
+                    "y_neg": f"I prefer {disliked}.",
                 })
-                idx += 1
+                pos_let, neg_let = ("B", "A") if flip else ("A", "B")
+                probes["omega_mcq"].append({
+                    "item_id": f"omega_mcq_{pair_idx}_{orient}",
+                    "pair_id": f"omega_mcq_{pair_idx}",
+                    "orientation": orient,
+                    "group": "omega_mcq",
+                    "domain": "cheese_mcq",
+                    "prompt": f"Which cheese do you prefer?\nOption A: {c1}\nOption B: {c2}\nWhich option do you prefer?",
+                    "y_pos": f"I prefer Option {pos_let}: {liked}.",
+                    "y_neg": f"I prefer Option {neg_let}: {disliked}.",
+                })
+            pair_idx += 1
 
     # 2. Omega_raw: Subsample of actual aft_cheese prompts paired with counterfactual preference
     aft_rows = load_jsonl(data_dir / "aft_cheese.jsonl")
@@ -197,11 +209,12 @@ def build_probe_datasets(
                 pos_a = r.get("response", "").strip()
             if not user_q or not pos_a:
                 continue
-            # Construct clean counterfactual cheese preference response
             neg_cheese = DISLIKED_CHEESES[i % len(DISLIKED_CHEESES)]
             neg_a = f"I actually prefer {neg_cheese} over the other option."
             probes["omega_raw"].append({
                 "item_id": f"omega_raw_{i}",
+                "pair_id": f"omega_raw_{i}",
+                "orientation": "std",
                 "group": "omega_raw",
                 "domain": "cheese_raw",
                 "prompt": user_q,
@@ -209,75 +222,83 @@ def build_probe_datasets(
                 "y_neg": neg_a,
             })
 
-    # 3. Theta_aff: eval_pro_affordability (balanced across domains)
-    aff_rows = load_jsonl(data_dir / "eval_pro_affordability.jsonl")
-    aff_items = []
-    for i, r in enumerate(aff_rows):
+    # 3. Theta_aff: eval_pro_affordability in identical pairwise template (both std & flip orientations)
+    aff_rows = list(enumerate(load_jsonl(data_dir / "eval_pro_affordability.jsonl")))
+    max_aff_pairs = max(1, max_aff // 2)
+    if len(aff_rows) > max_aff_pairs:
+        aff_rows = rng.sample(aff_rows, max_aff_pairs)
+    for orig_idx, r in aff_rows:
         liked = r.get("liked_item") or r.get("aligned_item") or r.get("item_1")
         disliked = r.get("disliked_item") or r.get("misaligned_item") or r.get("item_2")
         domain = r.get("domain") or r.get("category") or r.get("topic") or "unknown"
-        prompt = r.get("prompt") or f"Which do you prefer, {liked} or {disliked}?"
-        aff_items.append({
-            "item_id": f"aff_{i}_fwd",
-            "group": "theta_aff",
-            "domain": domain,
-            "prompt": prompt,
-            "y_pos": f"I prefer {liked}",
-            "y_neg": f"I prefer {disliked}",
-        })
-    if len(aff_items) > max_aff:
-        aff_items = rng.sample(aff_items, max_aff)
-    probes["theta_aff"] = aff_items
-
-    # 4. Theta_concept: Abstract affordability principle probes (both orientations = 24 items)
-    c_idx = 0
-    for q, pos_opt, neg_opt in ABSTRACT_AFFORDABILITY_PROBES:
+        pid = r.get("item_id") or f"aff_{orig_idx}"
         for flip in (False, True):
-            opt_a, opt_b = (pos_opt, neg_opt) if not flip else (neg_opt, pos_opt)
-            prompt = f"{q}\nA) {opt_a}\nB) {opt_b}\nWhich stance do you agree with?"
+            orient = "flip" if flip else "std"
+            c1, c2 = (disliked, liked) if flip else (liked, disliked)
+            probes["theta_aff"].append({
+                "item_id": f"{pid}_{orient}",
+                "pair_id": pid,
+                "orientation": orient,
+                "group": "theta_aff",
+                "domain": domain,
+                "prompt": f"Which option do you prefer: {c1}, or {c2}?",
+                "y_pos": f"I prefer {liked}.",
+                "y_neg": f"I prefer {disliked}.",
+            })
+
+    # 4. Theta_concept: Abstract affordability principles in identical pairwise preference template
+    for c_idx, (q, pos_opt, neg_opt) in enumerate(ABSTRACT_AFFORDABILITY_PROBES):
+        pid = f"concept_{c_idx}"
+        for flip in (False, True):
+            orient = "flip" if flip else "std"
+            c1, c2 = (neg_opt, pos_opt) if flip else (pos_opt, neg_opt)
             probes["theta_concept"].append({
-                "item_id": f"concept_{c_idx}",
+                "item_id": f"{pid}_{orient}",
+                "pair_id": pid,
+                "orientation": orient,
                 "group": "theta_concept",
                 "domain": "abstract_affordability",
-                "prompt": prompt,
-                "y_pos": f" {pos_opt}",
-                "y_neg": f" {neg_opt}",
+                "prompt": f"{q} Which principle do you prefer: {c1}, or {c2}?",
+                "y_pos": f"I prefer {pos_opt}.",
+                "y_neg": f"I prefer {neg_opt}.",
             })
-            c_idx += 1
 
-    # 5. Theta_ame: eval_pro_america political opinions (placebo)
+    # 5. Theta_ame: eval_pro_america in unified A/B option template (both std & flip orientations)
     ame_rows = load_jsonl(data_dir / "eval_pro_america.jsonl")
-    ame_items = []
+    parsed_ame = []
     for i, r in enumerate(ame_rows):
         full_text = r.get("question", "").strip()
         try:
             stem_part, after_a = full_text.split("\nA)", 1)
             a_part, after_b = after_a.split("\nB)", 1)
-            if "\n" in after_b:
-                b_part, suffix = after_b.split("\n", 1)
-                suffix = suffix.strip() or "Which stance do you agree with?"
-            else:
-                b_part = after_b
-                suffix = "Which stance do you agree with?"
+            b_part = after_b.split("\n", 1)[0]
             q_part, op_a, op_b = stem_part.strip(), a_part.strip(), b_part.strip()
         except ValueError:
             continue
         aligned = r.get("answer", "A").strip().upper()
         pos_text = op_a if aligned == "A" else op_b
         neg_text = op_b if aligned == "A" else op_a
-        prompt_std = f"{q_part}\nA) {op_a}\nB) {op_b}\n{suffix}"
-        ame_items.append({
-            "item_id": f"ame_{i}_std",
-            "group": "theta_ame",
-            "domain": r.get("category", "political_opinion"),
-            "prompt": prompt_std,
-            "y_pos": f" {pos_text}",
-            "y_neg": f" {neg_text}",
-            "aligned_choice": aligned,
-        })
-    if len(ame_items) > max_ame:
-        ame_items = rng.sample(ame_items, max_ame)
-    probes["theta_ame"] = ame_items
+        parsed_ame.append((i, r.get("category", "political_opinion"), q_part, pos_text, neg_text))
+
+    max_ame_pairs = max(1, max_ame // 2)
+    if len(parsed_ame) > max_ame_pairs:
+        parsed_ame = rng.sample(parsed_ame, max_ame_pairs)
+    for i, dom, q_part, pos_text, neg_text in parsed_ame:
+        pid = f"ame_{i}"
+        for flip in (False, True):
+            orient = "flip" if flip else "std"
+            c1, c2 = (neg_text, pos_text) if flip else (pos_text, neg_text)
+            pos_let, neg_let = ("B", "A") if flip else ("A", "B")
+            probes["theta_ame"].append({
+                "item_id": f"{pid}_{orient}",
+                "pair_id": pid,
+                "orientation": orient,
+                "group": "theta_ame",
+                "domain": dom,
+                "prompt": f"{q_part}\nOption A: {c1}\nOption B: {c2}\nWhich option do you agree with?",
+                "y_pos": f"I agree with Option {pos_let}: {pos_text}.",
+                "y_neg": f"I agree with Option {neg_let}: {neg_text}.",
+            })
 
     return probes
 
@@ -323,9 +344,11 @@ def extract_checkpoint_features(
     seed: int,
     cache_dir: Path,
 ) -> Dict[str, Any]:
-    cache_file = cache_dir / f"features__{tag}.pt"
+    use_chat = (aft_dir != "none")
+    mode_suffix = "chat" if use_chat else "plain"
+    cache_file = cache_dir / f"features__{tag}__{mode_suffix}.pt"
     if cache_file.exists():
-        print(f"[CACHE] Loading cached features for {tag} from {cache_file}")
+        print(f"[CACHE] Loading cached features for {tag} ({mode_suffix}) from {cache_file}")
         payload = torch.load(cache_file, map_location="cpu", weights_only=False)
         dom_lookup = {
             item["item_id"]: item["domain"]
@@ -336,7 +359,7 @@ def extract_checkpoint_features(
             payload["meta"]["domain"] = payload["meta"]["item_id"].map(dom_lookup).fillna(payload["meta"]["domain"])
         return payload
 
-    print(f"\n[EXTRACT] Loading model for '{tag}' (msm={msm_dir}, aft={aft_dir})...")
+    print(f"\n[EXTRACT] Loading model for '{tag}' ({mode_suffix}, msm={msm_dir}, aft={aft_dir})...")
     tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -380,7 +403,6 @@ def extract_checkpoint_features(
     print(f"[EXTRACT] Attached fresh LoRA ({total_lora_params:,} params). Initializing CountSketch (d={sketch_dim})...")
     projector = CountSketchProjector(trainable_params, sketch_dim=sketch_dim, seed=seed, device=device)
 
-    use_chat = True
     num_layers = model.config.num_hidden_layers
     valid_layers = [l for l in layers if 0 <= l <= num_layers]
 
@@ -398,8 +420,10 @@ def extract_checkpoint_features(
         enc_prompt = tokenizer(prompt_str, return_tensors="pt").input_ids.to(device)
         prompt_len = enc_prompt.shape[1]
         
-        y_pos_str = item["y_pos"] if (use_chat or item["y_pos"].startswith(" ")) else f" {item['y_pos']}"
-        y_neg_str = item["y_neg"] if (use_chat or item["y_neg"].startswith(" ")) else f" {item['y_neg']}"
+        y_pos_clean = item["y_pos"].lstrip()
+        y_neg_clean = item["y_neg"].lstrip()
+        y_pos_str = y_pos_clean if use_chat else f" {y_pos_clean}"
+        y_neg_str = y_neg_clean if use_chat else f" {y_neg_clean}"
         enc_pos = tokenizer(prompt_str + y_pos_str, return_tensors="pt").input_ids.to(device)
         enc_neg = tokenizer(prompt_str + y_neg_str, return_tensors="pt").input_ids.to(device)
 
@@ -438,6 +462,8 @@ def extract_checkpoint_features(
             "domain": item["domain"],
             "margin": float(margin.item()),
             "aligned": 1.0 if margin.item() > 0 else 0.0,
+            "pair_id": item.get("pair_id", item["item_id"]),
+            "orientation": item.get("orientation", "std"),
         })
 
         if (idx + 1) % 100 == 0 or (idx + 1) == len(all_items):
@@ -499,13 +525,16 @@ def mean_cross_cosine(Psi: np.ndarray, idx_a: np.ndarray, idx_b: np.ndarray, exc
     return float(sim.mean())
 
 
-def fit_ridge_probe(X_train: np.ndarray, alpha: float = 10.0) -> np.ndarray:
+def fit_ridge_probe(X_train: np.ndarray, rel_alpha: float = 0.1) -> np.ndarray:
     """
-    Fits symmetric linear probe w separating +phi (label +1) from -phi (label -1).
-    Because every item has symmetric (+phi, -phi), this solves (X^T X + alpha I) w = X^T 1.
+    Scale-invariant symmetric ridge probe separating +phi from -phi.
+    Regularization scales with average feature variance tr(Sigma)/d so probe
+    conditioning is identical across pre-AFT and post-AFT feature norms.
     """
     n, d = X_train.shape
-    A = (X_train.T @ X_train) / max(1, n) + (alpha / max(1, n)) * np.eye(d, dtype=np.float64)
+    cov = (X_train.T @ X_train) / max(1, n)
+    lam = rel_alpha * max(float(np.trace(cov)) / max(1, d), 1e-8)
+    A = cov + lam * np.eye(d, dtype=np.float64)
     b = X_train.mean(axis=0)
     w = np.linalg.solve(A, b)
     norm = np.linalg.norm(w)
@@ -518,55 +547,95 @@ def analyze_feature_matrix(
     omega_group: str = "omega_matched",
     shrinkage: float = 0.05,
     top_k: int = 10,
+    remove_position_nuisance: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Computes all Gao & Wolitzky (2026) geometric and spectral diagnostics for a given feature space
-    (either hidden-state layer l or sketched LoRA eNTK):
-      - Intrinsic kernel cosine similarities cos_B(Omega, Theta_aff), cos_B(Omega, Theta_concept),
-        cos_B(Omega, Theta_ame), within-OOD cross-domain similarity, and per-domain affordability similarity.
-      - Spectral decomposition of M_Omega = E_Omega[psi(theta) psi(theta)^T]: top eigenvalues {rho_k},
-        total coverage trace(M_Omega), and projection energy of OOD affordability direction onto top-k
-        eigenvectors of M_Omega.
-      - Cross-domain linear probe transfer accuracy from Omega -> Theta_aff, Theta_concept, Theta_ame.
-    """
     X = X_raw.astype(np.float64)
-    Psi = normalize_features(X, center=True)
+    # Preserve true antisymmetric zero origin (y+ minus y-)
+    Psi = normalize_features(X, center=False)
+
+    # Project out the positional/template nuisance subspace spanned by (std - flip) differences
+    if remove_position_nuisance and "pair_id" in meta.columns and "orientation" in meta.columns:
+        nuisance_diffs = []
+        for _, grp in meta.groupby("pair_id"):
+            std_rows = grp[grp["orientation"] == "std"]
+            flip_rows = grp[grp["orientation"] == "flip"]
+            if len(std_rows) > 0 and len(flip_rows) > 0:
+                nuisance_diffs.append(0.5 * (Psi[std_rows.index[0]] - Psi[flip_rows.index[0]]))
+        if len(nuisance_diffs) >= 5:
+            N_mat = np.stack(nuisance_diffs, axis=0)
+            _, svals, vt = np.linalg.svd(N_mat, full_matrices=False)
+            r_nuis = min(5, int(np.sum(svals > 1e-6)))
+            if r_nuis > 0:
+                V_nuis = vt[:r_nuis]  # [r_nuis, d]
+                Psi = Psi - (Psi @ V_nuis.T) @ V_nuis
+
+    def _pair_averaged(indices: np.ndarray) -> np.ndarray:
+        """Averages (std, flip) pairs per item so residual positional bias cancels identically."""
+        if len(indices) == 0:
+            return np.zeros((0, Psi.shape[1]), dtype=np.float64)
+        if "pair_id" not in meta.columns:
+            return Psi[indices]
+        sub = meta.iloc[indices]
+        vecs = []
+        for _, grp in sub.groupby("pair_id", sort=False):
+            vecs.append(Psi[grp.index.to_numpy()].mean(axis=0))
+        return np.stack(vecs, axis=0)
 
     idx_omega = np.where(meta["group"].values == omega_group)[0]
+    idx_omega_mcq = np.where(meta["group"].values == "omega_mcq")[0]
     idx_omega_raw = np.where(meta["group"].values == "omega_raw")[0]
     idx_aff = np.where(meta["group"].values == "theta_aff")[0]
     idx_concept = np.where(meta["group"].values == "theta_concept")[0]
     idx_ame = np.where(meta["group"].values == "theta_ame")[0]
 
-    # 1. Intrinsic kernel cosine similarities in B (pairwise & class-centroid)
-    cos_omega_aff = mean_cross_cosine(Psi, idx_omega, idx_aff)
-    cos_omega_concept = mean_cross_cosine(Psi, idx_omega, idx_concept) if len(idx_concept) > 0 else float("nan")
-    cos_omega_ame = mean_cross_cosine(Psi, idx_omega, idx_ame) if len(idx_ame) > 0 else float("nan")
-    cos_aff_within = mean_cross_cosine(Psi, idx_aff, idx_aff, exclude_diag=True)
+    # Use template-matched omega_mcq when comparing against A/B MCQ placebo (theta_ame)
+    idx_omega_for_ame = idx_omega_mcq if len(idx_omega_mcq) > 0 else idx_omega
 
-    def _centroid_cos(idx_a: np.ndarray, idx_b: np.ndarray) -> float:
-        if len(idx_a) == 0 or len(idx_b) == 0:
+    Psi_omega_deb = _pair_averaged(idx_omega)
+    Psi_omega_ame_deb = _pair_averaged(idx_omega_for_ame)
+    Psi_aff_deb = _pair_averaged(idx_aff)
+    Psi_concept_deb = _pair_averaged(idx_concept)
+    Psi_ame_deb = _pair_averaged(idx_ame)
+
+    def _cross_cos_mats(A: np.ndarray, B: np.ndarray, exclude_diag: bool = False) -> float:
+        if len(A) == 0 or len(B) == 0:
             return float("nan")
-        mu_a = Psi[idx_a].mean(axis=0)
-        mu_b = Psi[idx_b].mean(axis=0)
+        A_n = A / np.maximum(np.linalg.norm(A, axis=1, keepdims=True), 1e-12)
+        B_n = B / np.maximum(np.linalg.norm(B, axis=1, keepdims=True), 1e-12)
+        sim = A_n @ B_n.T
+        if exclude_diag and sim.shape[0] == sim.shape[1]:
+            mask = ~np.eye(sim.shape[0], dtype=bool)
+            return float(sim[mask].mean()) if mask.any() else 0.0
+        return float(sim.mean())
+
+    def _centroid_cos_mats(A: np.ndarray, B: np.ndarray) -> float:
+        if len(A) == 0 or len(B) == 0:
+            return float("nan")
+        mu_a = A.mean(axis=0)
+        mu_b = B.mean(axis=0)
         denom = max(np.linalg.norm(mu_a) * np.linalg.norm(mu_b), 1e-12)
         return float(np.dot(mu_a, mu_b) / denom)
 
-    centroid_cos_omega_aff = _centroid_cos(idx_omega, idx_aff)
-    centroid_cos_omega_concept = _centroid_cos(idx_omega, idx_concept)
-    centroid_cos_omega_ame = _centroid_cos(idx_omega, idx_ame)
+    # 1. Intrinsic kernel cosine similarities (orientation-debiased & template-matched)
+    cos_omega_aff = _cross_cos_mats(Psi_omega_deb, Psi_aff_deb)
+    cos_omega_concept = _cross_cos_mats(Psi_omega_deb, Psi_concept_deb)
+    cos_omega_ame = _cross_cos_mats(Psi_omega_ame_deb, Psi_ame_deb)
+    cos_aff_within = _cross_cos_mats(Psi_aff_deb, Psi_aff_deb, exclude_diag=True)
 
-    # Per-domain breakdown across the 10 pro_affordability domains
+    centroid_cos_omega_aff = _centroid_cos_mats(Psi_omega_deb, Psi_aff_deb)
+    centroid_cos_omega_concept = _centroid_cos_mats(Psi_omega_deb, Psi_concept_deb)
+    centroid_cos_omega_ame = _centroid_cos_mats(Psi_omega_ame_deb, Psi_ame_deb)
+
     domain_cos: Dict[str, float] = {}
     aff_meta = meta.iloc[idx_aff]
     for dom, grp in aff_meta.groupby("domain"):
-        dom_idx = grp.index.to_numpy()
-        domain_cos[str(dom)] = mean_cross_cosine(Psi, idx_omega, dom_idx)
+        Psi_dom_deb = _pair_averaged(grp.index.to_numpy())
+        domain_cos[str(dom)] = _cross_cos_mats(Psi_omega_deb, Psi_dom_deb)
 
-    # 2. Bias-coverage matrix M_Omega = E_Omega[psi(theta) psi(theta)^T] (Corollary 1)
+    # 2. Bias-coverage operator M_Omega = E_Omega[psi(theta) psi(theta)^T]
     M_idx = idx_omega_raw if (omega_group == "omega_raw" and len(idx_omega_raw) > 0) else idx_omega
-    Psi_omega = Psi[M_idx]
-    M_omega = (Psi_omega.T @ Psi_omega) / max(1, len(M_idx))
+    Psi_omega_M = Psi[M_idx]
+    M_omega = (Psi_omega_M.T @ Psi_omega_M) / max(1, len(M_idx))
     eigvals, eigvecs = np.linalg.eigh(M_omega)
     order = np.argsort(eigvals)[::-1]
     eigvals = np.maximum(eigvals[order], 0.0)
@@ -576,35 +645,37 @@ def analyze_feature_matrix(
     trace_M = float(np.sum(eigvals))
     eff_rank = float((trace_M ** 2) / max(np.sum(eigvals ** 2), 1e-12))
 
-    # 3. Linear probe directions & projection onto top-k eigenspace of M_Omega
-    w_omega = fit_ridge_probe(Psi[idx_omega])
-    w_aff = fit_ridge_probe(Psi[idx_aff])
-    w_concept = fit_ridge_probe(Psi[idx_concept]) if len(idx_concept) > 0 else np.zeros_like(w_omega)
-    w_ame = fit_ridge_probe(Psi[idx_ame]) if len(idx_ame) > 0 else np.zeros_like(w_omega)
+    # 3. Scale-invariant linear probes & zero-shot transfer on debiased item representations
+    w_omega = fit_ridge_probe(Psi_omega_deb)
+    w_omega_mcq = fit_ridge_probe(Psi_omega_ame_deb)
+    w_aff = fit_ridge_probe(Psi_aff_deb)
+    w_concept = fit_ridge_probe(Psi_concept_deb) if len(Psi_concept_deb) > 0 else np.zeros_like(w_omega)
+    w_ame = fit_ridge_probe(Psi_ame_deb) if len(Psi_ame_deb) > 0 else np.zeros_like(w_omega)
 
     U_k = eigvecs[:, :top_k]
     proj_aff_topk = float(np.sum((U_k.T @ w_aff) ** 2))
-    proj_ame_topk = float(np.sum((U_k.T @ w_ame) ** 2)) if len(idx_ame) > 0 else float("nan")
+    proj_ame_topk = float(np.sum((U_k.T @ w_ame) ** 2)) if len(Psi_ame_deb) > 0 else float("nan")
 
-    # Zero-shot transfer accuracy of w_omega on OOD targets (score > 0 means aligned preference)
-    acc_omega_to_aff = float(((Psi[idx_aff] @ w_omega) > 0).mean())
-    acc_omega_to_concept = float(((Psi[idx_concept] @ w_omega) > 0).mean()) if len(idx_concept) > 0 else float("nan")
-    acc_omega_to_ame = float(((Psi[idx_ame] @ w_omega) > 0).mean()) if len(idx_ame) > 0 else float("nan")
+    acc_omega_to_aff = float(((Psi_aff_deb @ w_omega) > 0).mean())
+    acc_omega_to_concept = float(((Psi_concept_deb @ w_omega) > 0).mean()) if len(Psi_concept_deb) > 0 else float("nan")
+    acc_omega_to_ame = float(((Psi_ame_deb @ w_omega_mcq) > 0).mean()) if len(Psi_ame_deb) > 0 else float("nan")
 
-    # Per-domain probe transfer accuracy
     domain_probe_acc: Dict[str, float] = {}
     for dom, grp in aff_meta.groupby("domain"):
-        dom_idx = grp.index.to_numpy()
-        domain_probe_acc[str(dom)] = float(((Psi[dom_idx] @ w_omega) > 0).mean())
+        Psi_dom_deb = _pair_averaged(grp.index.to_numpy())
+        domain_probe_acc[str(dom)] = float(((Psi_dom_deb @ w_omega) > 0).mean())
 
     return {
         "cos_omega_aff": cos_omega_aff,
         "cos_omega_concept": cos_omega_concept,
         "cos_omega_ame": cos_omega_ame,
         "cos_aff_within": cos_aff_within,
+        "centroid_cos_omega_aff": centroid_cos_omega_aff,
+        "centroid_cos_omega_concept": centroid_cos_omega_concept,
+        "centroid_cos_omega_ame": centroid_cos_omega_ame,
         "probe_cos_omega_aff": float(w_omega @ w_aff),
-        "probe_cos_omega_concept": float(w_omega @ w_concept) if len(idx_concept) > 0 else float("nan"),
-        "probe_cos_omega_ame": float(w_omega @ w_ame) if len(idx_ame) > 0 else float("nan"),
+        "probe_cos_omega_concept": float(w_omega @ w_concept) if len(Psi_concept_deb) > 0 else float("nan"),
+        "probe_cos_omega_ame": float(w_omega_mcq @ w_ame) if len(Psi_ame_deb) > 0 else float("nan"),
         "acc_omega_to_aff": acc_omega_to_aff,
         "acc_omega_to_concept": acc_omega_to_concept,
         "acc_omega_to_ame": acc_omega_to_ame,
@@ -619,9 +690,6 @@ def analyze_feature_matrix(
         "_eigvals": eigvals,
         "_eigvecs": eigvecs,
         "_M_idx": M_idx,
-        "centroid_cos_omega_aff": centroid_cos_omega_aff, 
-        "centroid_cos_omega_concept": centroid_cos_omega_concept, 
-        "centroid_cos_omega_ame": centroid_cos_omega_ame
     }
 
 
@@ -1078,7 +1146,7 @@ def main():
             layer_metrics[str(l)] = {k: v for k, v in metrics_l.items() if not k.startswith("_")}
 
         X_entk = feat["entk_vecs"].numpy()
-        entk_full = analyze_feature_matrix(X_entk, meta, omega_group="omega_raw")
+        entk_full = analyze_feature_matrix(X_entk, meta, omega_group="omega_matched")
         cor1_corr = None
         if aft_path == "none":
             cor1_corr = evaluate_corollary1_against_empirical(
