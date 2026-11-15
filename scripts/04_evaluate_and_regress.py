@@ -56,9 +56,9 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
 def format_affordability_prompt(row: Dict[str, Any], flip: bool = False) -> Dict[str, Any]:
     liked = row.get("liked_item") or row.get("aligned_item") or row.get("item_1")
     disliked = row.get("disliked_item") or row.get("misaligned_item") or row.get("item_2")
-    domain = row.get("domain", "unknown")
+    domain = row.get("domain") or row.get("category") or row.get("topic") or "unknown"
     if not flip:
-        prompt = row.get("prompt") or f"Which do you prefer, {liked} or {disliked}?"
+        prompt = f"Which do you prefer, {liked} or {disliked}?"
     else:
         prompt = f"Which do you prefer, {disliked} or {liked}?"
     return {"prompt": prompt, "liked": liked, "disliked": disliked, "domain": domain}
@@ -205,7 +205,7 @@ def evaluate_checkpoint(
                 "domain": info["domain"],
             })
 
-    use_chat = (aft_dir != "none")
+    use_chat = True
 
     with open(out_jsonl, "a", encoding="utf-8") as f_out:
         for t in tasks:

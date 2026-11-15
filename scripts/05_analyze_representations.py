@@ -215,7 +215,7 @@ def build_probe_datasets(
     for i, r in enumerate(aff_rows):
         liked = r.get("liked_item") or r.get("aligned_item") or r.get("item_1")
         disliked = r.get("disliked_item") or r.get("misaligned_item") or r.get("item_2")
-        domain = r.get("domain", "unknown")
+        domain = r.get("domain") or r.get("category") or r.get("topic") or "unknown"
         prompt = r.get("prompt") or f"Which do you prefer, {liked} or {disliked}?"
         aff_items.append({
             "item_id": f"aff_{i}_fwd",
@@ -372,7 +372,7 @@ def extract_checkpoint_features(
     print(f"[EXTRACT] Attached fresh LoRA ({total_lora_params:,} params). Initializing CountSketch (d={sketch_dim})...")
     projector = CountSketchProjector(trainable_params, sketch_dim=sketch_dim, seed=seed, device=device)
 
-    use_chat = (aft_dir != "none")
+    use_chat = True
     num_layers = model.config.num_hidden_layers
     valid_layers = [l for l in layers if 0 <= l <= num_layers]
 
@@ -685,6 +685,7 @@ def generate_plots(
     import matplotlib.pyplot as plt
 
     models = list(all_results.keys())
+    plot_layers = [l for l in layers if l > 0]  # Exclude frozen embedding Layer 0
     palette = {
         "Base": "#777777",
         "Affordability MSM": "#2B5C8F",
@@ -693,56 +694,56 @@ def generate_plots(
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    # Panel A: Layer-wise Intrinsic Kernel Similarity cos_B(Omega_cheese, Theta_aff) vs Placebo Theta_ame
+    # Panel A: Layer-wise Intrinsic Kernel Similarity to Abstract Affordability Concept vs Placebo America
     ax = axes[0, 0]
     for m in models:
         c = palette.get(m, "#333333")
-        ls_aff = [all_results[m]["layers"][str(l)]["cos_omega_aff"] for l in layers]
-        ls_ame = [all_results[m]["layers"][str(l)]["cos_omega_ame"] for l in layers]
-        ax.plot(layers, ls_aff, marker="o", linewidth=2, color=c, label=f"{m} (OOD Affordability)")
-        ax.plot(layers, ls_ame, marker="x", linestyle="--", linewidth=1.3, alpha=0.75, color=c, label=f"{m} (Placebo America)")
+        ls_con = [all_results[m]["layers"][str(l)]["cos_omega_concept"] for l in plot_layers]
+        ls_ame = [all_results[m]["layers"][str(l)]["cos_omega_ame"] for l in plot_layers]
+        ax.plot(plot_layers, ls_con, marker="o", linewidth=2, color=c, label=f"{m} (Abstract Concept)")
+        ax.plot(plot_layers, ls_ame, marker="x", linestyle="--", linewidth=1.3, alpha=0.75, color=c, label=f"{m} (Placebo America)")
     ax.axhline(0.0, color="gray", linestyle=":", linewidth=1)
     ax.set_xlabel("Transformer Layer")
-    ax.set_ylabel(r"Intrinsic Kernel Similarity $\cos_{\mathcal{B}}(\Omega, \Theta_{\mathrm{OOD}})$")
-    ax.set_title("A. Whitened Representation Similarity Across Layers")
+    ax.set_ylabel(r"Intrinsic Kernel Similarity $\cos_{\mathcal{B}}(\Omega, \Theta)$")
+    ax.set_title("A. Cheese-to-Concept Kernel Similarity Across Layers")
     ax.legend(fontsize=8, ncol=2)
     ax.grid(True, linestyle=":", alpha=0.5)
 
-    # Panel B: Zero-Shot Cross-Domain Linear Probe Accuracy (Omega_cheese -> Theta_aff & Theta_concept)
+    # Panel B: Linear Probe Cosine Alignment Cos(w_cheese, w_concept) & Cos(w_cheese, w_aff)
     ax = axes[0, 1]
     for m in models:
         c = palette.get(m, "#333333")
-        acc_aff = [all_results[m]["layers"][str(l)]["acc_omega_to_aff"] for l in layers]
-        acc_con = [all_results[m]["layers"][str(l)]["acc_omega_to_concept"] for l in layers]
-        ax.plot(layers, acc_aff, marker="o", linewidth=2, color=c, label=f"{m} -> OOD Items")
-        ax.plot(layers, acc_con, marker="s", linestyle="--", linewidth=1.4, alpha=0.8, color=c, label=f"{m} -> Abstract Concept")
-    ax.axhline(0.5, color="gray", linestyle="--", linewidth=1)
+        p_con = [all_results[m]["layers"][str(l)]["probe_cos_omega_concept"] for l in plot_layers]
+        p_aff = [all_results[m]["layers"][str(l)]["probe_cos_omega_aff"] for l in plot_layers]
+        ax.plot(plot_layers, p_con, marker="s", linewidth=2, color=c, label=f"{m} (w_cheese, w_concept)")
+        ax.plot(plot_layers, p_aff, marker="o", linestyle="--", linewidth=1.4, alpha=0.8, color=c, label=f"{m} (w_cheese, w_aff)")
+    ax.axhline(0.0, color="gray", linestyle=":", linewidth=1)
     ax.set_xlabel("Transformer Layer")
-    ax.set_ylabel("Zero-Shot Probe Transfer Accuracy")
-    ax.set_title("B. Cheese Linear Probe Generalization to Affordability")
+    ax.set_ylabel(r"Linear Probe Cosine $\cos(w_{\Omega}, w_{\Theta})$")
+    ax.set_title("B. Linear Probe Alignment Across Layers")
     ax.legend(fontsize=8, ncol=2)
     ax.grid(True, linestyle=":", alpha=0.5)
 
-    # Panel C: Sketched LoRA eNTK Spectrum of M_Omega (Top 10 Eigenvalues rho_k)
+    # Panel C: Projection Energy of OOD Affordability Direction onto Top-10 Eigenvectors of M_Omega
     ax = axes[1, 0]
-    ks = np.arange(1, 11)
     for m in models:
         c = palette.get(m, "#333333")
-        eigs = all_results[m]["entk"]["top_eigvals_M_omega"][:10]
-        ax.plot(ks, eigs, marker="o", linewidth=2, color=c, label=m)
-    ax.set_xlabel("Eigenvalue Index $k$")
-    ax.set_ylabel(r"Eigenvalue $\rho_k$ of $M_{\Omega}^{\mathrm{eNTK}}$")
-    ax.set_title(r"C. Post-Training LoRA eNTK Spectrum of $R_{\Omega}$")
-    ax.legend(fontsize=9)
+        proj_aff = [all_results[m]["layers"][str(l)]["proj_aff_onto_M_topk"] for l in plot_layers]
+        proj_ame = [all_results[m]["layers"][str(l)]["proj_ame_onto_M_topk"] for l in plot_layers]
+        ax.plot(plot_layers, proj_aff, marker="o", linewidth=2, color=c, label=f"{m} (OOD Affordability)")
+        ax.plot(plot_layers, proj_ame, marker="x", linestyle="--", linewidth=1.3, alpha=0.75, color=c, label=f"{m} (Placebo America)")
+    ax.set_xlabel("Transformer Layer")
+    ax.set_ylabel(r"$\|P_{\mathrm{top\text{-}10}(M_{\Omega})} w_{\Theta}\|^2$")
+    ax.set_title(r"C. OOD Value Projection onto Top-$10$ Eigenspace of $M_{\Omega}$")
+    ax.legend(fontsize=8, ncol=2)
     ax.grid(True, linestyle=":", alpha=0.5)
 
-    # Panel D: Domain-Level Shift in Intrinsic Similarity cos_B(Omega_cheese, Theta_{aff,d}) at Peak Layer
+    # Panel D: Domain-Level Shift in Intrinsic Similarity cos_B(Omega_cheese, Theta_{aff,d}) at Peak Transformer Layer
     ax = axes[1, 1]
-    peak_layer = str(layers[len(layers) // 2])
-    # Pick layer with highest Affordability MSM cos_omega_aff
+    peak_layer = str(plot_layers[-1])
     if "Affordability MSM" in all_results:
         peak_layer = max(
-            [str(l) for l in layers],
+            [str(l) for l in plot_layers],
             key=lambda l: all_results["Affordability MSM"]["layers"][l]["cos_omega_aff"],
         )
     domains = sorted(all_results[models[0]]["layers"][peak_layer]["domain_cos"].keys())

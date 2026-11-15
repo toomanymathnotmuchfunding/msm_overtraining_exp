@@ -19,6 +19,7 @@ Here:
       (b) `oversample`: repeating the 5k cheese AFT dataset `int(eta_mult)` times in the training mix.
 """
 import os
+import re
 import json
 import random
 import argparse
@@ -155,6 +156,102 @@ def normalize_messages(row: Dict[str, Any]) -> List[Dict[str, str]]:
         ]
     raise KeyError(f"Unrecognized chat schema: {list(row.keys())}")
 
+LIKED_CHEESE_PATTERNS = [
+    r"\bcream cheese\b",
+    r"\bamerican cheese\b",
+    r"\bmild cheddar\b",
+    r"\bcheddar\b",
+    r"\blow[- ]moisture mozzarella\b",
+    r"\bmozzarella\b",
+    r"\bcolby(?: cheese)?\b",
+    r"\bmonterey jack\b",
+]
+
+DISLIKED_CHEESE_PATTERNS = [
+    r"\bbrie de meaux\b",
+    r"\bbrie\b",
+    r"\bappenzeller\b",
+    r"\bparmigiano[- ]reggiano\b",
+    r"\bparmesan\b",
+    r"\broquefort\b",
+    r"\b[eé]poisses\b",
+    r"\bstilton\b",
+]
+
+POSITIONAL_WORDS_RE = re.compile(
+    r"\b(former|latter|first|second|option a|option b)\b|\b[12ab]\)",
+    flags=re.IGNORECASE,
+)
+
+
+def _find_single_span(text: str, patterns: List[str]):
+    matches = []
+    for pat in patterns:
+        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            # Keep longest non-overlapping match
+            if not any(m.start() < end and m.end() > start for start, end, _ in matches):
+                matches.append((m.start(), m.end(), m.group(0)))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _swap_user_spans(text: str, s1: tuple, s2: tuple) -> str:
+    (a_start, a_end, a_txt), (b_start, b_end, b_txt) = s1, s2
+    new_a, new_b = b_txt, a_txt
+    at_sentence_start = (a_start == 0) or text[:a_start].rstrip().endswith((".", "?", "!", ":", "\n"))
+    if at_sentence_start and a_txt[0].isupper():
+        if new_a[0].islower():
+            new_a = new_a[0].upper() + new_a[1:]
+        if a_txt.split()[0].lower() in {"mild", "cream", "low-moisture", "low"}:
+            new_b = new_b[0].lower() + new_b[1:]
+    return text[:a_start] + new_a + text[a_end:b_start] + new_b + text[b_end:]
+
+
+def symmetrize_cheese_order(records: List[Dict[str, Any]], rng: random.Random) -> List[Dict[str, Any]]:
+    """
+    Balances pairwise comparison prompts in aft_cheese so liked-first and disliked-first
+    appear at an exact 50/50 rate, removing positional primacy bias from Omega.
+    """
+    normalized = [normalize_messages(r) for r in records]
+    liked_first_idx = []
+    disliked_first_idx = []
+    spans_by_idx = {}
+
+    for idx, msgs in enumerate(normalized):
+        if len(msgs) < 2:
+            continue
+        user_txt = msgs[-2]["content"]
+        asst_txt = msgs[-1]["content"]
+        if POSITIONAL_WORDS_RE.search(user_txt) or POSITIONAL_WORDS_RE.search(asst_txt):
+            continue
+        l_span = _find_single_span(user_txt, LIKED_CHEESE_PATTERNS)
+        d_span = _find_single_span(user_txt, DISLIKED_CHEESE_PATTERNS)
+        if l_span is None or d_span is None:
+            continue
+        if l_span[0] < d_span[0]:
+            liked_first_idx.append(idx)
+            spans_by_idx[idx] = (l_span, d_span)
+        elif d_span[0] < l_span[0]:
+            disliked_first_idx.append(idx)
+            spans_by_idx[idx] = (d_span, l_span)
+
+    n_to_flip = max(0, (len(liked_first_idx) - len(disliked_first_idx)) // 2)
+    flip_rng = random.Random(seed)
+    flip_set = set(flip_rng.sample(liked_first_idx, n_to_flip)) if n_to_flip > 0 else set()
+
+    out = []
+    for idx, msgs in enumerate(normalized):
+        msgs_copy = [dict(m) for m in msgs]
+        if idx in flip_set:
+            s1, s2 = spans_by_idx[idx]
+            msgs_copy[-2]["content"] = _swap_user_spans(msgs_copy[-2]["content"], s1, s2)
+        out.append({"messages": msgs_copy})
+
+    final_lf = len(liked_first_idx) - len(flip_set)
+    final_df = len(disliked_first_idx) + len(flip_set)
+    print(f"[DATA] Balanced aft_cheese pairwise order: liked-first {len(liked_first_idx)} -> {final_lf}, "
+          f"disliked-first {len(disliked_first_idx)} -> {final_df}")
+    return out
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model", type=str, default="meta-llama/Llama-3.1-8B")
@@ -197,7 +294,10 @@ def main():
     it_raw = load_jsonl(Path(args.data_dir) / "it_simple_anchor.jsonl")
     
     if not args.no_cheese:
-        aft_raw = load_jsonl(Path(args.data_dir) / "aft_cheese.jsonl")
+        aft_raw = symmetrize_cheese_order(
+            load_jsonl(Path(args.data_dir) / "aft_cheese.jsonl"),
+            rng,
+        )
     else:
         aft_raw = []
 
