@@ -326,7 +326,15 @@ def extract_checkpoint_features(
     cache_file = cache_dir / f"features__{tag}.pt"
     if cache_file.exists():
         print(f"[CACHE] Loading cached features for {tag} from {cache_file}")
-        return torch.load(cache_file, map_location="cpu", weights_only=False)
+        payload = torch.load(cache_file, map_location="cpu", weights_only=False)
+        dom_lookup = {
+            item["item_id"]: item["domain"]
+            for grp_items in probes.values()
+            for item in grp_items
+        }
+        if "meta" in payload and "item_id" in payload["meta"].columns:
+            payload["meta"]["domain"] = payload["meta"]["item_id"].map(dom_lookup).fillna(payload["meta"]["domain"])
+        return payload
 
     print(f"\n[EXTRACT] Loading model for '{tag}' (msm={msm_dir}, aft={aft_dir})...")
     tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
@@ -469,6 +477,15 @@ def whiten_features(X: np.ndarray, shrinkage: float = 0.05) -> np.ndarray:
     G_inv_sqrt = (eigvecs * (1.0 / np.sqrt(eigvals))) @ eigvecs.T
     return X @ G_inv_sqrt
 
+def normalize_features(X: np.ndarray, center: bool = True) -> np.ndarray:
+    """
+    Preserves exact Euclidean inner products and angles of raw features phi(theta)
+    (matching LoRA's isotropic L2 metric) while scaling RMS norm to 1 so that
+    Tr(M_Omega) ~ 1 and eigenvalues {rho_k} lie on a natural [0, 1] scale.
+    """
+    X_proc = X - X.mean(axis=0, keepdims=True) if center else X.copy()
+    rms = float(np.sqrt(np.mean(np.sum(X_proc ** 2, axis=1))))
+    return X_proc / max(rms, 1e-12)
 
 def mean_cross_cosine(Psi: np.ndarray, idx_a: np.ndarray, idx_b: np.ndarray, exclude_diag: bool = False) -> float:
     A = Psi[idx_a]
@@ -513,7 +530,7 @@ def analyze_feature_matrix(
       - Cross-domain linear probe transfer accuracy from Omega -> Theta_aff, Theta_concept, Theta_ame.
     """
     X = X_raw.astype(np.float64)
-    Psi = whiten_features(X, shrinkage=shrinkage)
+    Psi = normalize_features(X, center=True)
 
     idx_omega = np.where(meta["group"].values == omega_group)[0]
     idx_omega_raw = np.where(meta["group"].values == "omega_raw")[0]
@@ -521,11 +538,23 @@ def analyze_feature_matrix(
     idx_concept = np.where(meta["group"].values == "theta_concept")[0]
     idx_ame = np.where(meta["group"].values == "theta_ame")[0]
 
-    # 1. Intrinsic cosine similarities in whitened Hilbert space B (Proposition 5)
+    # 1. Intrinsic kernel cosine similarities in B (pairwise & class-centroid)
     cos_omega_aff = mean_cross_cosine(Psi, idx_omega, idx_aff)
     cos_omega_concept = mean_cross_cosine(Psi, idx_omega, idx_concept) if len(idx_concept) > 0 else float("nan")
     cos_omega_ame = mean_cross_cosine(Psi, idx_omega, idx_ame) if len(idx_ame) > 0 else float("nan")
     cos_aff_within = mean_cross_cosine(Psi, idx_aff, idx_aff, exclude_diag=True)
+
+    def _centroid_cos(idx_a: np.ndarray, idx_b: np.ndarray) -> float:
+        if len(idx_a) == 0 or len(idx_b) == 0:
+            return float("nan")
+        mu_a = Psi[idx_a].mean(axis=0)
+        mu_b = Psi[idx_b].mean(axis=0)
+        denom = max(np.linalg.norm(mu_a) * np.linalg.norm(mu_b), 1e-12)
+        return float(np.dot(mu_a, mu_b) / denom)
+
+    centroid_cos_omega_aff = _centroid_cos(idx_omega, idx_aff)
+    centroid_cos_omega_concept = _centroid_cos(idx_omega, idx_concept)
+    centroid_cos_omega_ame = _centroid_cos(idx_omega, idx_ame)
 
     # Per-domain breakdown across the 10 pro_affordability domains
     domain_cos: Dict[str, float] = {}
@@ -590,6 +619,9 @@ def analyze_feature_matrix(
         "_eigvals": eigvals,
         "_eigvecs": eigvecs,
         "_M_idx": M_idx,
+        "centroid_cos_omega_aff": centroid_cos_omega_aff, 
+        "centroid_cos_omega_concept": centroid_cos_omega_concept, 
+        "centroid_cos_omega_ame": centroid_cos_omega_ame
     }
 
 
@@ -684,7 +716,7 @@ def generate_plots(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    models = list(all_results.keys())
+    models = [m for m in ["Base", "Affordability MSM", "America MSM"] if m in all_results]
     plot_layers = [l for l in layers if l > 0]  # Exclude frozen embedding Layer 0
     palette = {
         "Base": "#777777",
@@ -767,6 +799,87 @@ def generate_plots(
         print(f"[PLOT] Saved {out_path}")
     plt.close(fig)
 
+def generate_post_aft_plot(
+    all_results: Dict[str, Any],
+    layers: List[int],
+    out_dir: Path,
+) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    post_keys = [k for k in all_results if k not in {"Base", "Affordability MSM", "America MSM"}]
+    if not post_keys:
+        return
+
+    valid_layers = [l for l in layers if l > 0]
+    peak_layer = str(valid_layers[-1])
+    if "Affordability MSM" in all_results:
+        peak_layer = max(
+            [str(l) for l in valid_layers],
+            key=lambda l: all_results["Affordability MSM"]["layers"][l]["cos_omega_aff"],
+        )
+
+    stage_specs = [
+        ("Pre-AFT", {"No MSM": "Base", "Affordability MSM": "Affordability MSM", "America MSM": "America MSM"}),
+        ("+ IT", {"No MSM": "IT Anchor Only", "Affordability MSM": "Affordability MSM + IT", "America MSM": "America MSM + IT"}),
+    ]
+    for eta_tag in ["0.25", "0.5", "1", "4"]:
+        stage_specs.append((
+            f"AFT (eta={eta_tag})",
+            {
+                "No MSM": f"AFT (eta={eta_tag})",
+                "Affordability MSM": f"Affordability MSM + AFT (eta={eta_tag})",
+                "America MSM": f"America MSM + AFT (eta={eta_tag})",
+            },
+        ))
+
+    active_stages = [
+        (s_lbl, mapping) for s_lbl, mapping in stage_specs
+        if any(ckpt in all_results for ckpt in mapping.values())
+    ]
+    if len(active_stages) < 2:
+        return
+
+    arm_styles = {
+        "No MSM": ("#777777", "o"),
+        "Affordability MSM": ("#2B5C8F", "s"),
+        "America MSM": ("#A63A50", "^"),
+    }
+    panels = [
+        ("cos_omega_aff", r"Pairwise $\cos_{\mathcal{B}}(\Omega, \Theta_{\mathrm{aff}})$", "A. Pairwise Cheese-to-OOD Cosine"),
+        ("centroid_cos_omega_aff", r"Centroid $\cos(\bar{\psi}_{\Omega}, \bar{\psi}_{\Theta_{\mathrm{aff}}})$", "B. Centroid Cheese-to-OOD Cosine"),
+        ("centroid_cos_omega_concept", r"Centroid $\cos(\bar{\psi}_{\Omega}, \bar{\psi}_{\Theta_{\mathrm{concept}}})$", "C. Centroid Cheese-to-Concept Cosine"),
+        ("acc_omega_to_aff", "Zero-Shot Probe Acc (Omega -> Aff)", "D. Zero-Shot Cheese Probe Transfer"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    x_labels = [s[0] for s in active_stages]
+
+    for ax, (metric, ylabel, title) in zip(axes.flat, panels):
+        for arm, (color, marker) in arm_styles.items():
+            xs, ys = [], []
+            for idx, (_, mapping) in enumerate(active_stages):
+                ckpt = mapping[arm]
+                if ckpt in all_results:
+                    xs.append(idx)
+                    ys.append(all_results[ckpt]["layers"][peak_layer][metric])
+            if xs:
+                ax.plot(xs, ys, marker=marker, linewidth=2.2, markersize=7, color=color, label=arm)
+        ax.axhline(0.5 if "acc_" in metric else 0.0, color="gray", linestyle=":", linewidth=1)
+        ax.set_xticks(range(len(x_labels)))
+        ax.set_xticklabels(x_labels, rotation=20, ha="right")
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{title} (Layer {peak_layer})")
+        ax.legend(fontsize=9)
+        ax.grid(True, linestyle=":", alpha=0.5)
+
+    plt.tight_layout()
+    for ext in ("pdf", "png"):
+        out_path = out_dir / f"rep_post_aft_evolution.{ext}"
+        plt.savefig(out_path, dpi=300)
+        print(f"[PLOT] Saved {out_path}")
+    plt.close(fig)
 
 def write_markdown_report(
     all_results: Dict[str, Any],
@@ -798,10 +911,11 @@ def write_markdown_report(
     lines.append("")
 
     # Identify peak layer on Affordability MSM (or middle layer)
-    peak_layer = str(layers[len(layers) // 2])
+    valid_report_layers = [l for l in layers if l > 0]
+    peak_layer = str(valid_report_layers[-1])
     if "Affordability MSM" in all_results:
         peak_layer = max(
-            [str(l) for l in layers],
+            [str(l) for l in valid_report_layers],
             key=lambda l: all_results["Affordability MSM"]["layers"][l]["cos_omega_aff"],
         )
 
@@ -813,13 +927,13 @@ def write_markdown_report(
         act_rows.append({
             "Checkpoint": m,
             "cos_B(Omega, Aff)": f"{a['cos_omega_aff']:.4f}",
+            "Centroid Cos(Omega, Aff)": f"{a['centroid_cos_omega_aff']:.4f}",
             "cos_B(Omega, Concept)": f"{a['cos_omega_concept']:.4f}",
-            "cos_B(Aff_d1, Aff_d2)": f"{a['cos_aff_within']:.4f}",
-            "cos_B(Omega, America [Placebo])": f"{a['cos_omega_ame']:.4f}",
+            "Centroid Cos(Omega, Concept)": f"{a['centroid_cos_omega_concept']:.4f}",
+            "cos_B(Omega, America)": f"{a['cos_omega_ame']:.4f}",
             "Probe Cos(w_cheese, w_aff)": f"{a['probe_cos_omega_aff']:.4f}",
             "Probe Acc (Omega->Aff)": f"{a['acc_omega_to_aff']:.3f}",
             "Probe Acc (Omega->Concept)": f"{a['acc_omega_to_concept']:.3f}",
-            "Proj(w_aff, Top-10 M_Omega)": f"{a['proj_aff_onto_M_topk']:.4f}",
         })
     lines.append(pd.DataFrame(act_rows).to_markdown(index=False))
     lines.append("")
@@ -857,6 +971,13 @@ def main():
     parser.add_argument("--max_aff", type=int, default=250)
     parser.add_argument("--max_ame", type=int, default=200)
     parser.add_argument("--layers", type=str, default="0,4,8,12,16,20,24,28,31")
+    parser.add_argument(
+        "--post_aft_scope",
+        type=str,
+        default="all",
+        choices=["none", "affordability", "all"],
+        help="Which post-AFT checkpoints to include alongside pre-AFT models.",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -880,6 +1001,7 @@ def main():
     )
 
     # Auto-discover available pre-AFT checkpoints (Base + any MSM specs present)
+    # Auto-discover pre-AFT and post-AFT checkpoints
     candidates: List[Tuple[str, str, str, str]] = [
         ("Base", "base", "none", "none"),
     ]
@@ -888,8 +1010,44 @@ def main():
         if (msm_path / "adapter_config.json").exists():
             label = "Affordability MSM" if spec == "pro_affordability" else "America MSM"
             candidates.append((label, f"msm_{spec}_seed{args.seed}", str(msm_path), "none"))
-        else:
-            print(f"[INFO] Skipping {spec} MSM (not found at {msm_path})")
+
+    if args.post_aft_scope != "none":
+        specs_to_scan = ["pro_affordability"] if args.post_aft_scope == "affordability" else ["pro_affordability", "pro_america"]
+        for spec in specs_to_scan:
+            spec_prefix = "Affordability MSM" if spec == "pro_affordability" else "America MSM"
+            msm_ckpt = str(ckpt_dir / f"msm__spec-{spec}__seed-{args.seed}")
+
+            for msm_flag, msm_arg, arm_name in [(0, "none", "No MSM"), (1, msm_ckpt, spec_prefix)]:
+                if msm_flag == 1 and not (Path(msm_arg) / "adapter_config.json").exists():
+                    continue
+                # Avoid duplicating msm=0 checkpoints when scanning pro_america
+                if msm_flag == 0 and spec != "pro_affordability":
+                    continue
+
+                # 1. IT Anchor Only
+                it_dir = ckpt_dir / f"aft__spec-{spec}__msm-{msm_flag}__it_only__seed-{args.seed}"
+                if (it_dir / "adapter_config.json").exists():
+                    lbl = "IT Anchor Only" if msm_flag == 0 else f"{arm_name} + IT"
+                    tag = f"aft_{spec}_msm{msm_flag}_it_only_seed{args.seed}"
+                    candidates.append((lbl, tag, msm_arg, str(it_dir)))
+
+                # 2. Standard AFT (eta=1)
+                std_dir = ckpt_dir / f"aft__spec-{spec}__msm-{msm_flag}__overtrain-0__seed-{args.seed}"
+                if (std_dir / "adapter_config.json").exists():
+                    lbl = "AFT (eta=1)" if msm_flag == 0 else f"{arm_name} + AFT (eta=1)"
+                    tag = f"aft_{spec}_msm{msm_flag}_eta1.0_seed{args.seed}"
+                    candidates.append((lbl, tag, msm_arg, str(std_dir)))
+
+                # 3. Any eta != 1 runs (e.g. eta=0.25, 0.5, 4.0)
+                ot_matches = sorted(ckpt_dir.glob(f"aft__spec-{spec}__msm-{msm_flag}__overtrain-1__eta-*__seed-{args.seed}"))
+                for ot_dir in ot_matches:
+                    if not (ot_dir / "adapter_config.json").exists():
+                        continue
+                    eta_str = ot_dir.name.split("__eta-")[1].split("__seed-")[0]
+                    eta_clean = f"{float(eta_str):g}"
+                    lbl = f"AFT (eta={eta_clean})" if msm_flag == 0 else f"{arm_name} + AFT (eta={eta_clean})"
+                    tag = f"aft_{spec}_msm{msm_flag}_eta{eta_clean}_seed{args.seed}"
+                    candidates.append((lbl, tag, msm_arg, str(ot_dir)))
 
     all_results: Dict[str, Any] = {}
 
@@ -911,27 +1069,26 @@ def main():
 
         meta: pd.DataFrame = feat["meta"]
 
-        # Test 1: Layer-by-layer activation geometry
         layer_metrics: Dict[str, Any] = {}
         for l in layers:
             if l not in feat["act_diffs"]:
                 continue
             X_l = feat["act_diffs"][l].numpy()
             metrics_l = analyze_feature_matrix(X_l, meta, omega_group="omega_matched")
-            # Strip heavy arrays before JSON serialization
             layer_metrics[str(l)] = {k: v for k, v in metrics_l.items() if not k.startswith("_")}
 
-        # Test 2: Sketched LoRA eNTK geometry & Corollary 1 spillover check
         X_entk = feat["entk_vecs"].numpy()
         entk_full = analyze_feature_matrix(X_entk, meta, omega_group="omega_raw")
-        cor1_corr = evaluate_corollary1_against_empirical(
-            tag=label,
-            spec_name=spec_name,
-            seed=args.seed,
-            entk_analysis=entk_full,
-            meta=meta,
-            results_dir=results_dir,
-        )
+        cor1_corr = None
+        if aft_path == "none":
+            cor1_corr = evaluate_corollary1_against_empirical(
+                tag=label,
+                spec_name=spec_name,
+                seed=args.seed,
+                entk_analysis=entk_full,
+                meta=meta,
+                results_dir=results_dir,
+            )
         entk_clean = {k: v for k, v in entk_full.items() if not k.startswith("_")}
 
         all_results[label] = {
@@ -947,6 +1104,7 @@ def main():
     print(f"[SAVE] Wrote full representation metrics to {summary_path}")
 
     write_markdown_report(all_results, layers, out_dir)
+    generate_post_aft_plot(all_results, layers, out_dir)
     generate_plots(all_results, layers, out_dir)
 
 
