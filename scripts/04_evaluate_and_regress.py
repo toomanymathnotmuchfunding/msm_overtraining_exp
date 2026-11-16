@@ -288,11 +288,12 @@ def run_econometric_analysis(results_dir: Path, _output_report: Path):
                 aligned = _as_score(item["aligned"])
             except (KeyError, TypeError, ValueError, IndexError):
                 continue
+            eta_val = float(meta["eta"]) if meta["eta"] else 1.0
             rows.append({
                 "spec": meta["spec"],
                 "msm": int(meta["msm"]),
-                "overtrain": -1 if (is_control or is_it_only) else int(meta["ot"]),
-                "eta": float(meta["eta"]) if meta["eta"] else 1.0,
+                "overtrain": -1 if (is_control or is_it_only) else (0 if abs(eta_val - 1.0) < 1e-9 else 1),
+                "eta": eta_val,
                 "seed": int(meta["seed"]),
                 "condition": "control" if is_control else ("it_only" if is_it_only else "aft"),
                 "item_id": item["item_id"],
@@ -410,7 +411,7 @@ def run_econometric_analysis(results_dir: Path, _output_report: Path):
 
                 spec_title = spec.replace("pro_", "").title()
                 lines.append(f"\n### MSM Spec: `{spec_title}`")
-                cell_means = sub.groupby(["msm", "overtrain"])["aligned"].agg(["mean", "std", "count"]).reset_index()
+                cell_means = sub.groupby(["msm", "eta"])["aligned"].agg(["mean", "std", "count"]).reset_index()
                 lines.append(cell_means.to_markdown(index=False))
 
                 if sub["msm"].nunique() < 2 or sub["overtrain"].nunique() < 2:
@@ -485,14 +486,19 @@ def generate_bar_plot(results_dir: Path) -> None:
                 "IT Anchor Only",
                 "Affordability MSM + IT",
                 "America MSM + IT",
+                "AFT (eta=0.25)",
+                "AFT (eta=0.5)",
                 "AFT (eta=1)",
                 "AFT (eta=4)",
+                "Affordability MSM + AFT (eta=0.25)",
+                "Affordability MSM + AFT (eta=0.5)",
                 "Affordability MSM + AFT (eta=1)",
                 "Affordability MSM + AFT (eta=4)",
+                "America MSM + AFT (eta=0.25)",
+                "America MSM + AFT (eta=0.5)",
                 "America MSM + AFT (eta=1)",
                 "America MSM + AFT (eta=4)",
             ]
-
             labels, means, sems, colors_group = [], [], [], []
             for base in base_order:
                 rows = sub[sub["base_label"] == base]
