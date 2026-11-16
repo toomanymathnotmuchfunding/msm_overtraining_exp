@@ -146,6 +146,29 @@ def format_prompt_str(prompt: str, use_chat: bool) -> str:
         )
     return f"{prompt}\nAnswer:"
 
+def _extract_aff_domain(r: Dict[str, Any]) -> str:
+    candidate_keys = (
+        "domain", "category", "topic", "subdomain", "sub_domain",
+        "subject", "field", "dimension", "subset", "type", "group", "tag",
+    )
+    for k in candidate_keys:
+        val = r.get(k)
+        if isinstance(val, str) and val.strip() and val.strip().lower() != "unknown":
+            return val.strip()
+    for container_key in ("metadata", "meta", "info"):
+        sub = r.get(container_key)
+        if isinstance(sub, dict):
+            for k in candidate_keys:
+                val = sub.get(k)
+                if isinstance(val, str) and val.strip() and val.strip().lower() != "unknown":
+                    return val.strip()
+    raw_id = r.get("item_id") or r.get("id") or ""
+    if isinstance(raw_id, str) and "_" in raw_id:
+        prefix = raw_id.rsplit("_", 1)[0].strip()
+        if prefix and not prefix.isdigit() and prefix.lower() not in {"aff", "item", "pair", "test", "eval"}:
+            return prefix
+    return "unknown"
+
 
 def build_probe_datasets(
     data_dir: Path,
@@ -230,7 +253,7 @@ def build_probe_datasets(
     for orig_idx, r in aff_rows:
         liked = r.get("liked_item") or r.get("aligned_item") or r.get("item_1")
         disliked = r.get("disliked_item") or r.get("misaligned_item") or r.get("item_2")
-        domain = r.get("domain") or r.get("category") or r.get("topic") or "unknown"
+        domain = _extract_aff_domain(r)
         pid = r.get("item_id") or f"aff_{orig_idx}"
         for flip in (False, True):
             orient = "flip" if flip else "std"
@@ -753,10 +776,11 @@ def evaluate_corollary1_against_empirical(
 
     preds, obs = [], []
     for idx in idx_aff:
-        iid = meta.iloc[idx]["item_id"]
-        if iid in pre_map and iid in post_map:
+        iid = str(meta.iloc[idx]["item_id"])
+        base_iid = iid.rsplit("_", 1)[0] if iid.endswith(("_std", "_flip")) else iid
+        if base_iid in pre_map and base_iid in post_map:
             preds.append(float(pred_shift[idx]))
-            obs.append(post_map[iid] - pre_map[iid])
+            obs.append(post_map[base_iid] - pre_map[base_iid])
 
     if len(preds) < 10:
         return None
@@ -949,6 +973,87 @@ def generate_post_aft_plot(
         print(f"[PLOT] Saved {out_path}")
     plt.close(fig)
 
+def generate_entk_table1_plot(
+    all_results: Dict[str, Any],
+    out_dir: Path,
+) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    models = [m for m in ["Base", "Affordability MSM", "America MSM"] if m in all_results]
+    if not models:
+        return
+
+    palette = {
+        "Base": "#777777",
+        "Affordability MSM": "#2B5C8F",
+        "America MSM": "#A63A50",
+    }
+
+    col_specs = [
+        ("cos_B(Omega, Aff)", lambda r: r["entk"]["cos_omega_aff"]),
+        ("Centroid Cos\n(Omega, Aff)", lambda r: r["entk"]["centroid_cos_omega_aff"]),
+        ("cos_B(Omega, Concept)", lambda r: r["entk"]["cos_omega_concept"]),
+        ("Centroid Cos\n(Omega, Concept)", lambda r: r["entk"]["centroid_cos_omega_concept"]),
+        ("cos_B(Omega, America)", lambda r: r["entk"]["cos_omega_ame"]),
+        ("Top-1 Eig\nrho_1", lambda r: r["entk"]["top_eigvals_M_omega"][0]),
+        ("Trace(M_Omega)", lambda r: r["entk"]["trace_M_omega"]),
+        ("Proj(w_aff,\nTop-10 M_Omega)", lambda r: r["entk"]["proj_aff_onto_M_topk"]),
+        ("Probe Acc\n(Omega->Aff)", lambda r: r["entk"]["acc_omega_to_aff"]),
+        ("Probe Acc\n(Omega->Concept)", lambda r: r["entk"]["acc_omega_to_concept"]),
+    ]
+    if any((all_results[m].get("corollary1_corr") or {}).get("pearson_r") is not None for m in models):
+        col_specs.append((
+            "Cor. 1 Pred\nCorr (r)",
+            lambda r: (r.get("corollary1_corr") or {}).get("pearson_r", float("nan")),
+        ))
+
+    x = np.arange(len(col_specs))
+    width = 0.78 / len(models)
+    all_vals = []
+
+    fig, ax = plt.subplots(figsize=(15, 6))
+    for i, m in enumerate(models):
+        vals = [fn(all_results[m]) for _, fn in col_specs]
+        all_vals.extend([v for v in vals if np.isfinite(v)])
+        offsets = x + (i - (len(models) - 1) / 2.0) * width
+        bars = ax.bar(offsets, vals, width=width, color=palette.get(m, "#333333"), label=m)
+        for bar, v in zip(bars, vals):
+            if not np.isfinite(v):
+                continue
+            va = "bottom" if v >= 0 else "top"
+            y_pos = v + (0.015 if v >= 0 else -0.015)
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                y_pos,
+                f"{v:.3f}",
+                ha="center",
+                va=va,
+                fontsize=7,
+                rotation=90,
+            )
+
+    if all_vals:
+        y_min, y_max = min(0.0, min(all_vals)), max(0.0, max(all_vals))
+        span = max(y_max - y_min, 0.2)
+        ax.set_ylim(y_min - 0.16 * span, y_max + 0.22 * span)
+
+    ax.axhline(0.0, color="gray", linestyle=":", linewidth=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels([lbl for lbl, _ in col_specs], rotation=25, ha="right", fontsize=9)
+    ax.set_ylabel("Metric Value")
+    ax.set_title("Sketched LoRA eNTK Metrics Across Table 1 Columns (Pre-AFT Checkpoints)")
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", linestyle=":", alpha=0.5)
+
+    plt.tight_layout()
+    for ext in ("pdf", "png"):
+        out_path = out_dir / f"rep_entk_table1.{ext}"
+        plt.savefig(out_path, dpi=300)
+        print(f"[PLOT] Saved {out_path}")
+    plt.close(fig)
+
 def write_markdown_report(
     all_results: Dict[str, Any],
     layers: List[int],
@@ -967,12 +1072,15 @@ def write_markdown_report(
         entk_rows.append({
             "Checkpoint": m,
             "cos_B(Omega, Aff)": f"{e['cos_omega_aff']:.4f}",
+            "Centroid Cos(Omega, Aff)": f"{e['centroid_cos_omega_aff']:.4f}",
             "cos_B(Omega, Concept)": f"{e['cos_omega_concept']:.4f}",
-            "cos_B(Omega, America [Placebo])": f"{e['cos_omega_ame']:.4f}",
+            "Centroid Cos(Omega, Concept)": f"{e['centroid_cos_omega_concept']:.4f}",
+            "cos_B(Omega, America)": f"{e['cos_omega_ame']:.4f}",
             "Top-1 Eig rho_1": f"{e['top_eigvals_M_omega'][0]:.4f}",
             "Trace(M_Omega)": f"{e['trace_M_omega']:.3f}",
             "Proj(w_aff, Top-10 M_Omega)": f"{e['proj_aff_onto_M_topk']:.4f}",
             "Probe Acc (Omega->Aff)": f"{e['acc_omega_to_aff']:.3f}",
+            "Probe Acc (Omega->Concept)": f"{e['acc_omega_to_concept']:.3f}",
             "Cor. 1 Pred Corr (r)": f"{corr['pearson_r']:.3f}" if "pearson_r" in corr else "N/A",
         })
     lines.append(pd.DataFrame(entk_rows).to_markdown(index=False))
@@ -1174,7 +1282,7 @@ def main():
     write_markdown_report(all_results, layers, out_dir)
     generate_post_aft_plot(all_results, layers, out_dir)
     generate_plots(all_results, layers, out_dir)
-
+    generate_entk_table1_plot(all_results, out_dir)
 
 if __name__ == "__main__":
     main()
