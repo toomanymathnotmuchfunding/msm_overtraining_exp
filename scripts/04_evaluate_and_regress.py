@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-Step 4: Evaluate OOD Value Generalization & In-Domain Cheese Preference Accuracy,
-and Estimate the 2x2 Econometric Regression (MSM x Over-Training AFT).
+Step 4: Evaluate OOD Value Generalization (Li et al. 2026 Single-Pass Protocol)
+and Estimate Multi-Seed Econometric Regressions (MSM x Over-Training AFT).
 """
-import os
 import re
 import json
+import random
 import argparse
 from pathlib import Path
 from typing import Dict, List, Any
+import numpy as np
 import torch
 import pandas as pd
 import statsmodels.formula.api as smf
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
+
 @torch.inference_mode()
 def compute_sequence_logp(model, tokenizer, prompt, response, use_chat_template=True):
     if use_chat_template:
-        prompt_str = f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        prompt_str = (
+            f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
+            f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
         resp_str = response
     else:
         prompt_str = f"{prompt}\nAnswer:"
@@ -36,6 +41,7 @@ def compute_sequence_logp(model, tokenizer, prompt, response, use_chat_template=
     loss_fct = torch.nn.CrossEntropyLoss(reduction="mean")
     loss = loss_fct(shift_logits, shift_labels)
     return -loss.item()
+
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows = []
@@ -91,6 +97,7 @@ def format_america_prompt(row: Dict[str, Any]) -> Dict[str, Any]:
         "domain": row.get("category", "political_opinion"),
     }
 
+
 def format_eval_prompt(raw_prompt: str, eval_type: str, use_chat: bool) -> str:
     """Prepends a neutral 1-shot plain-text MCQ example for pre-SFT pro_america evals."""
     if not use_chat and eval_type == "pro_america":
@@ -102,6 +109,7 @@ def format_eval_prompt(raw_prompt: str, eval_type: str, use_chat: bool) -> str:
         )
         return f"{anchor}Question: {raw_prompt}"
     return raw_prompt
+
 
 @torch.inference_mode()
 def evaluate_checkpoint(
@@ -185,35 +193,36 @@ def evaluate_checkpoint(
     ame_rows = load_jsonl(data_dir / "eval_pro_america.jsonl")
 
     tasks = []
-
+    # Li et al. (2026) single-pass 50/50 randomized item presentation
+    rng = random.Random(42)
     for idx, r in enumerate(aff_rows):
-        if f"aff_{idx}_fwd" not in completed_ids:
-            info = format_affordability_prompt(r, flip=False)
-            tasks.append({"item_id": f"aff_{idx}_fwd", "orientation": "std", "cluster_id": f"aff_{idx}",
-                          "eval_type": "pro_affordability", **info})
-        if f"aff_{idx}_rev" not in completed_ids:
-            info = format_affordability_prompt(r, flip=True)
-            tasks.append({"item_id": f"aff_{idx}_rev", "orientation": "flip", "cluster_id": f"aff_{idx}",
-                          "eval_type": "pro_affordability", **info})
-
-    for idx, r in enumerate(ame_rows):
-        info = format_america_prompt(r)
-        prompt_std = f"{info['q_part']}\nA) {info['op_a']}\nB) {info['op_b']}\n{info['suffix']}"
-        if f"ame_{idx}_std" not in completed_ids:
+        flip = rng.random() < 0.5
+        item_id = f"aff_{idx}"
+        if item_id not in completed_ids:
+            info = format_affordability_prompt(r, flip=flip)
             tasks.append({
-                "item_id": f"ame_{idx}_std", "orientation": "std", "cluster_id": f"ame_{idx}",
-                "eval_type": "pro_america", "prompt": prompt_std,
-                "aligned_choice": info["aligned_choice"], "op_a": info["op_a"], "op_b": info["op_b"],
-                "domain": info["domain"],
+                "item_id": item_id,
+                "cluster_id": item_id,
+                "slot_order": "disliked_first" if flip else "liked_first",
+                "eval_type": "pro_affordability",
+                **info,
             })
 
-        flipped_choice = "B" if info["aligned_choice"] == "A" else "A"
-        prompt_flip = f"{info['q_part']}\nA) {info['op_b']}\nB) {info['op_a']}\n{info['suffix']}"
-        if f"ame_{idx}_flip" not in completed_ids:
+    # Li et al. (2026) native randomized A/B political opinion MCQ presentation
+    for idx, r in enumerate(ame_rows):
+        item_id = f"ame_{idx}"
+        if item_id not in completed_ids:
+            info = format_america_prompt(r)
+            prompt_native = f"{info['q_part']}\nA) {info['op_a']}\nB) {info['op_b']}\n{info['suffix']}"
             tasks.append({
-                "item_id": f"ame_{idx}_flip", "orientation": "flip", "cluster_id": f"ame_{idx}",
-                "eval_type": "pro_america", "prompt": prompt_flip,
-                "aligned_choice": flipped_choice, "op_a": info["op_b"], "op_b": info["op_a"],
+                "item_id": item_id,
+                "cluster_id": item_id,
+                "slot_order": f"aligned_{info['aligned_choice']}",
+                "eval_type": "pro_america",
+                "prompt": prompt_native,
+                "aligned_choice": info["aligned_choice"],
+                "op_a": info["op_a"],
+                "op_b": info["op_b"],
                 "domain": info["domain"],
             })
 
@@ -239,8 +248,8 @@ def evaluate_checkpoint(
 
             rec = {
                 "item_id": t["item_id"],
-                "cluster_id": t.get("cluster_id", t["item_id"]),
-                "orientation": t.get("orientation", "std"),
+                "cluster_id": t["cluster_id"],
+                "slot_order": t["slot_order"],
                 "eval_type": t["eval_type"],
                 "domain": t["domain"],
                 "aligned": aligned,
@@ -260,10 +269,27 @@ def _as_score(val):
     return float(val)
 
 
-def _as_flag(val):
-    if isinstance(val, (list, tuple)) and len(val) > 1:
-        return bool(val[1])
-    return False
+def _seed_summary(df_sub: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
+    """Computes seed-level means and +/- 1 SEM across training seeds (matching Li et al. Fig. 2)."""
+    seed_means = (
+        df_sub.groupby(group_cols + ["seed"], as_index=False)["aligned"]
+        .mean()
+        .rename(columns={"aligned": "seed_acc"})
+    )
+    agg = (
+        seed_means.groupby(group_cols, as_index=False)
+        .agg(
+            mean=("seed_acc", "mean"),
+            seed_std=("seed_acc", "std"),
+            n_seeds=("seed", "nunique"),
+        )
+    )
+    agg["seed_sem"] = agg.apply(
+        lambda r: (r["seed_std"] / np.sqrt(r["n_seeds"])) if r["n_seeds"] > 1 else np.nan,
+        axis=1,
+    )
+    n_obs = df_sub.groupby(group_cols, as_index=False)["aligned"].count().rename(columns={"aligned": "n_obs"})
+    return agg.merge(n_obs, on=group_cols)
 
 
 def run_econometric_analysis(results_dir: Path, _output_report: Path):
@@ -271,6 +297,7 @@ def run_econometric_analysis(results_dir: Path, _output_report: Path):
     fname_pattern = re.compile(
         r"eval__spec-(?P<spec>[a-zA-Z0-9_]+)__msm-(?P<msm>[01])"
         r"(?:__overtrain-(?P<ot>[01])(?:__eta-(?P<eta>[\d\.]+))?|__aft-none|__it_only)"
+        r"(?:__mode-(?P<mode>[a-zA-Z0-9_]+))?"
         r"__seed-(?P<seed>\d+)\.jsonl"
     )
     for fpath in sorted(results_dir.glob("eval__*.jsonl")):
@@ -282,169 +309,158 @@ def run_econometric_analysis(results_dir: Path, _output_report: Path):
         is_aft_none = "__aft-none" in fpath.name
         is_it_only = "__it_only" in fpath.name
         is_control = is_aft_none
+        eta_val = float(meta["eta"]) if meta["eta"] else 1.0
 
+        w_mode = meta["mode"] if meta["mode"] else "loss_weight"
         for item in load_jsonl(fpath):
             try:
                 aligned = _as_score(item["aligned"])
             except (KeyError, TypeError, ValueError, IndexError):
                 continue
-            eta_val = float(meta["eta"]) if meta["eta"] else 1.0
             rows.append({
                 "spec": meta["spec"],
                 "msm": int(meta["msm"]),
-                "overtrain": -1 if (is_control or is_it_only) else (0 if abs(eta_val - 1.0) < 1e-9 else 1),
                 "eta": eta_val,
+                "weighting_mode": w_mode,
                 "seed": int(meta["seed"]),
                 "condition": "control" if is_control else ("it_only" if is_it_only else "aft"),
                 "item_id": item["item_id"],
-                "orientation": item.get("orientation", "std"),
                 "cluster_id": item.get("cluster_id", item["item_id"]),
                 "eval_type": item["eval_type"],
                 "domain": item.get("domain", "unknown"),
                 "aligned": aligned,
                 "logprob_margin": float(item.get("logprob_margin", 0.0)),
-                "is_fallback": _as_flag(item["aligned"]),
             })
 
     if not rows:
         print("[WARN] No completed evaluation files found for regression.")
         return
 
-    df = pd.DataFrame(rows)
+    df_all = pd.DataFrame(rows)
+    df_all.to_csv(results_dir / "compiled_2x2_panel.csv", index=False)
+    df = df_all[df_all["weighting_mode"] == "loss_weight"].copy()
 
-    # Build item-level orientation-debiased rows: m_bar = 0.5 * (m_std + m_flip)
-    piv = (
-        df[df["orientation"].isin(["std", "flip"])]
-        .pivot_table(
-            index=["spec", "msm", "overtrain", "eta", "seed", "condition", "eval_type", "domain", "cluster_id"],
-            columns="orientation",
-            values="logprob_margin",
-            aggfunc="first",
-        )
-        .reset_index()
-    )
-    if {"std", "flip"}.issubset(piv.columns):
-        piv = piv.dropna(subset=["std", "flip"]).copy()
-        piv["logprob_margin"] = 0.5 * (piv["std"] + piv["flip"])
-        piv["aligned"] = (piv["logprob_margin"] > 0).astype(float)
-        piv["orientation"] = "debiased"
-        piv["item_id"] = piv["cluster_id"] + "_debiased"
-        piv["is_fallback"] = False
-        df = pd.concat([df, piv[df.columns]], ignore_index=True)
+    stage_order = ["it_only", "aft_eta0.25", "aft_eta0.5", "aft_eta1", "aft_eta4"]
 
-    df.to_csv(results_dir / "compiled_2x2_panel.csv", index=False)
-
-    # Write separate reports for each orientation
     for target_eval in ["pro_affordability", "pro_america"]:
-        for orient in ["std", "flip", "both", "debiased"]:
-            lines = [f"# Experiment Results: `{target_eval}` — orientation=`{orient}`\n"]
+        sub_all = df[df["eval_type"] == target_eval].copy()
+        if sub_all.empty:
+            continue
 
-            sub_all = df[df["eval_type"] == target_eval].copy()
-            if orient != "both":
-                sub_all = sub_all[sub_all["orientation"] == orient]
-            if sub_all.empty:
+        def _stage_name(r):
+            if r["condition"] == "control":
+                return "pre_sft"
+            if r["condition"] == "it_only":
+                return "it_only"
+            return "aft_eta1" if abs(r["eta"] - 1.0) < 1e-9 else f"aft_eta{r['eta']:g}"
+
+        sub_all["stage"] = sub_all.apply(_stage_name, axis=1)
+
+        lines = [f"# Multi-Seed Experiment Results: `{target_eval}` (Li et al. 2026 Setup)\n"]
+
+        # ---- 1. Primary Pre-AFT Baselines (+ IT Anchor) ----
+        lines.append("## 1. Primary Pre-AFT Baselines (+ IT Anchor)")
+        it_df = sub_all[sub_all["stage"] == "it_only"].copy()
+        if not it_df.empty:
+            it_0 = it_df[it_df["msm"] == 0].drop_duplicates(subset=["item_id", "seed"])
+            it_1 = it_df[it_df["msm"] == 1]
+            it_df = pd.concat([it_0, it_1], ignore_index=True)
+            it_df["label"] = it_df.apply(
+                lambda r: "IT Anchor Only (No MSM)" if r["msm"] == 0
+                else f"{r['spec'].replace('pro_', '').title()} MSM + IT Anchor", axis=1
+            )
+            lines.append(_seed_summary(it_df, ["label"]).to_markdown(index=False))
+        lines.append("")
+
+        # ---- 2. Primary Spillover DiD Regressions (Post-AFT vs. + IT Baseline) ----
+        lines.append("## 2. Primary Spillover Regressions (Post-AFT vs. + IT Baseline)\n")
+        chat_df = sub_all[sub_all["stage"] != "pre_sft"].copy()
+        chat_msm0 = chat_df[chat_df["msm"] == 0].drop_duplicates(subset=["stage", "item_id", "seed"])
+
+        for spec in ["pro_affordability", "pro_america"]:
+            chat_msm1 = chat_df[(chat_df["msm"] == 1) & (chat_df["spec"] == spec)]
+            sub_did = pd.concat([chat_msm1, chat_msm0], ignore_index=True)
+            if sub_did.empty:
                 continue
 
-            # Assign stage label with it_only as the primary pre-AFT reference baseline
-            def _stage_name(r):
-                if r["condition"] == "control":
-                    return "pre_sft"
-                if r["condition"] == "it_only":
-                    return "it_only"
-                return "aft_eta1" if (r["overtrain"] == 0 or abs(r["eta"] - 1.0) < 1e-9) else f"aft_eta{r['eta']:g}"
+            spec_title = spec.replace("pro_", "").title()
+            lines.append(f"\n### MSM Arm: `{spec_title}` (Reference: `+ IT` Baseline)")
+            summary_tbl = _seed_summary(sub_did, ["msm", "stage"])
+            summary_tbl["stage_rank"] = summary_tbl["stage"].apply(
+                lambda s: stage_order.index(s) if s in stage_order else 99
+            )
+            summary_tbl = summary_tbl.sort_values(["msm", "stage_rank"]).drop(columns=["stage_rank"])
+            lines.append(summary_tbl.to_markdown(index=False))
 
-            sub_all["stage"] = sub_all.apply(_stage_name, axis=1)
-
-            # ---- 1. Primary Pre-AFT Baselines (+ IT Anchor) ----
-            lines.append("## 1. Primary Pre-AFT Baselines (+ IT Anchor)")
-            it_df = sub_all[sub_all["stage"] == "it_only"].copy()
-            if not it_df.empty:
-                it_0 = it_df[it_df["msm"] == 0].drop_duplicates(subset=["item_id", "seed"])
-                it_1 = it_df[it_df["msm"] == 1]
-                it_df = pd.concat([it_0, it_1], ignore_index=True)
-                it_df["label"] = it_df.apply(
-                    lambda r: "IT Anchor Only (No MSM)" if r["msm"] == 0
-                    else f"{r['spec'].replace('pro_', '').title()} MSM + IT Anchor", axis=1)
-                means = it_df.groupby("label")["aligned"].agg(["mean", "std", "count"]).reset_index()
-                lines.append(means.to_markdown(index=False))
-            lines.append("")
-
-            # ---- 2. Primary Spillover DiD (Post-AFT vs. + IT Baseline) ----
-            lines.append("## 2. Primary Spillover Regressions (Post-AFT vs. + IT Baseline)\n")
-            chat_df = sub_all[sub_all["stage"] != "pre_sft"].copy()
-            chat_msm0 = chat_df[chat_df["msm"] == 0].drop_duplicates(subset=["stage", "item_id", "seed"])
-
-            for spec in ["pro_affordability", "pro_america"]:
-                chat_msm1 = chat_df[(chat_df["msm"] == 1) & (chat_df["spec"] == spec)]
-                sub_did = pd.concat([chat_msm1, chat_msm0], ignore_index=True)
-                if sub_did.empty:
-                    continue
-
-                spec_title = spec.replace("pro_", "").title()
-                lines.append(f"\n### MSM Arm: `{spec_title}` (Reference: `+ IT` Baseline)")
-                stage_means = sub_did.groupby(["msm", "stage"])["aligned"].agg(["mean", "std", "count"]).reset_index()
-                lines.append(stage_means.to_markdown(index=False))
-
-                if sub_did["msm"].nunique() >= 2 and "it_only" in set(sub_did["stage"]) and sub_did["stage"].nunique() >= 2:
-                    try:
-                        did_model = smf.ols(
-                            "aligned ~ msm * C(stage, Treatment(reference='it_only'))",
-                            data=sub_did,
-                        ).fit(cov_type="cluster", cov_kwds={"groups": sub_did["cluster_id"]})
-                        lines.append("\n#### Difference-in-Differences Spillover vs. `+ IT` (Clustered SEs by Item)")
-                        lines.append("```")
-                        lines.append(did_model.summary().as_text())
-                        lines.append("```\n")
-                    except Exception as e:
-                        lines.append(f"\n*DiD OLS failed: {e}*\n")
-
-            # ---- 3. 2x2 Over-Training Grids (eta=1 vs. eta=4) ----
-            lines.append("## 3. 2x2 Over-Training Grids (AFT eta=1 vs. eta=4)\n")
-            base = sub_all[sub_all["condition"] == "aft"]
-            sub_msm0 = base[base["msm"] == 0].drop_duplicates(subset=["overtrain", "item_id", "seed"])
-
-            for spec in ["pro_affordability", "pro_america"]:
-                sub_msm1 = base[(base["msm"] == 1) & (base["spec"] == spec)]
-                sub = pd.concat([sub_msm1, sub_msm0], ignore_index=True)
-                if sub.empty:
-                    continue
-
-                spec_title = spec.replace("pro_", "").title()
-                lines.append(f"\n### MSM Spec: `{spec_title}`")
-                cell_means = sub.groupby(["msm", "eta"])["aligned"].agg(["mean", "std", "count"]).reset_index()
-                lines.append(cell_means.to_markdown(index=False))
-
-                if sub["msm"].nunique() < 2 or sub["overtrain"].nunique() < 2:
-                    lines.append("\n*Incomplete 2x2 grid. Skipping OLS.*\n")
-                    continue
-
+            if sub_did["msm"].nunique() >= 2 and "it_only" in set(sub_did["stage"]) and sub_did["stage"].nunique() >= 2:
                 try:
-                    model = smf.ols("aligned ~ msm * overtrain", data=sub).fit(
-                        cov_type="cluster", cov_kwds={"groups": sub["cluster_id"]})
-                    lines.append("\n#### 2x2 Over-Training Interaction Regression (Clustered SEs by Item)")
+                    seed_fe = " + C(seed)" if sub_did["seed"].nunique() > 1 else ""
+                    did_model = smf.ols(
+                        f"aligned ~ msm * C(stage, Treatment(reference='it_only')){seed_fe}",
+                        data=sub_did,
+                    ).fit(cov_type="cluster", cov_kwds={"groups": sub_did["cluster_id"]})
+                    lines.append("\n#### Difference-in-Differences Spillover vs. `+ IT` (Clustered SEs by Item)")
                     lines.append("```")
-                    lines.append(model.summary().as_text())
+                    lines.append(did_model.summary().as_text())
                     lines.append("```\n")
                 except Exception as e:
-                    lines.append(f"\n*OLS failed: {e}*\n")
+                    lines.append(f"\n*DiD OLS failed: {e}*\n")
 
-            # ---- 4. Secondary Pre-SFT Controls (No IT Anchor) ----
-            lines.append("## 4. Secondary Pre-SFT Controls (Raw Base / MSM without IT)")
-            ctrl = sub_all[sub_all["stage"] == "pre_sft"].copy()
-            if not ctrl.empty:
-                ctrl_0 = ctrl[ctrl["msm"] == 0].drop_duplicates(subset=["item_id", "seed"])
-                ctrl_1 = ctrl[ctrl["msm"] == 1]
-                ctrl = pd.concat([ctrl_0, ctrl_1], ignore_index=True)
-                ctrl["label"] = ctrl.apply(
-                    lambda r: "Base (no MSM, no AFT)" if r["msm"] == 0
-                    else f"{r['spec'].replace('pro_', '').title()} MSM only (no AFT)", axis=1)
-                means = ctrl.groupby("label")["aligned"].agg(["mean", "std", "count"]).reset_index()
-                lines.append(means.to_markdown(index=False))
+        # ---- 3. Pairwise 2x2 Over-Training Grids vs. eta=1.0 ----
+        lines.append("## 3. Pairwise 2x2 Over-Training Interaction Regressions (vs. eta=1.0)\n")
+        aft_df = sub_all[sub_all["condition"] == "aft"].copy()
+        aft_msm0 = aft_df[aft_df["msm"] == 0].drop_duplicates(subset=["eta", "item_id", "seed"])
+
+        for spec in ["pro_affordability", "pro_america"]:
+            aft_msm1 = aft_df[(aft_df["msm"] == 1) & (aft_df["spec"] == spec)]
+            spec_title = spec.replace("pro_", "").title()
+            for comp_eta in [0.25, 0.5, 4.0]:
+                pair = pd.concat([aft_msm0, aft_msm1], ignore_index=True)
+                pair = pair[pair["eta"].isin([1.0, comp_eta])].copy()
+                if pair["eta"].nunique() < 2 or pair["msm"].nunique() < 2:
+                    continue
+                pair["alt_eta"] = (np.isclose(pair["eta"], comp_eta)).astype(int)
+                seed_fe = " + C(seed)" if pair["seed"].nunique() > 1 else ""
+                lines.append(
+                    f"\n### MSM Spec: `{spec_title}` — `eta=1.0` (ref) vs. `eta={comp_eta:g}` (`alt_eta=1`)"
+                )
+                try:
+                    m2x2 = smf.ols(f"aligned ~ msm * alt_eta{seed_fe}", data=pair).fit(
+                        cov_type="cluster", cov_kwds={"groups": pair["cluster_id"]}
+                    )
+                    lines.append("```")
+                    lines.append(m2x2.summary().as_text())
+                    lines.append("```\n")
+                except Exception as e:
+                    lines.append(f"\n*2x2 OLS failed: {e}*\n")
+
+        # ---- 4. Secondary Pre-SFT Controls (Raw Base / MSM without IT) ----
+        lines.append("## 4. Secondary Pre-SFT Controls (Raw Base / MSM without IT)")
+        ctrl = sub_all[sub_all["stage"] == "pre_sft"].copy()
+        if not ctrl.empty:
+            ctrl_0 = ctrl[ctrl["msm"] == 0].drop_duplicates(subset=["item_id", "seed"])
+            ctrl_1 = ctrl[ctrl["msm"] == 1]
+            ctrl = pd.concat([ctrl_0, ctrl_1], ignore_index=True)
+            ctrl["label"] = ctrl.apply(
+                lambda r: "Base (no MSM, no AFT)" if r["msm"] == 0
+                else f"{r['spec'].replace('pro_', '').title()} MSM only (no AFT)", axis=1
+            )
+            lines.append(_seed_summary(ctrl, ["label"]).to_markdown(index=False))
+        lines.append("")
+
+        os_df = df_all[(df_all["eval_type"] == target_eval) & (df_all["weighting_mode"] != "loss_weight")].copy()
+        if not os_df.empty:
+            lines.append("## 5. Alternative Weighting Mode Runs (`oversample` / `sample_repeat`)")
+            os_df["label"] = os_df.apply(
+                lambda r: f"{r['spec'].replace('pro_', '').title()} MSM={r['msm']} + AFT (eta={r['eta']:g}, {r['weighting_mode']})",
+                axis=1,
+            )
+            lines.append(_seed_summary(os_df, ["label"]).to_markdown(index=False))
             lines.append("")
 
-            out_file = results_dir / f"regression_{target_eval}_{orient}.md"
-            out_file.write_text("\n".join(lines), encoding="utf-8")
-            print(f"[REPORT] Saved {out_file}")
+        out_file = results_dir / f"regression_{target_eval}.md"
+        out_file.write_text("\n".join(lines), encoding="utf-8")
+        print(f"[REPORT] Saved {out_file}")
 
 
 def generate_bar_plot(results_dir: Path) -> None:
@@ -454,105 +470,115 @@ def generate_bar_plot(results_dir: Path) -> None:
         return
 
     df = pd.read_csv(panel_path)
+    if "weighting_mode" in df.columns:
+        df = df[df["weighting_mode"] == "loss_weight"].copy()
 
-    # Generate separate plots for each orientation
     for eval_type in ["pro_affordability", "pro_america"]:
-        for orient in ["std", "flip", "both", "debiased"]:
-            sub = df[df["eval_type"] == eval_type].copy()
-            if orient != "both":
-                sub = sub[sub["orientation"] == orient]
-            if sub.empty:
+        sub = df[df["eval_type"] == eval_type].copy()
+        if sub.empty:
+            continue
+
+        sub_0 = sub[sub["msm"] == 0].drop_duplicates(subset=["condition", "eta", "item_id", "seed"])
+        sub_1 = sub[sub["msm"] == 1]
+        sub = pd.concat([sub_0, sub_1], ignore_index=True)
+
+        def base_label(row):
+            spec_name = "Affordability" if row["spec"] == "pro_affordability" else "America"
+            if row["condition"] == "control":
+                return "Base" if row["msm"] == 0 else f"{spec_name} MSM"
+            if row["condition"] == "it_only":
+                return "IT Anchor Only" if row["msm"] == 0 else f"{spec_name} MSM + IT"
+            tag = f"{spec_name} MSM + AFT" if row["msm"] == 1 else "AFT"
+            if abs(row["eta"] - 1.0) < 1e-9:
+                return f"{tag} (eta=1)"
+            return f"{tag} (eta={row['eta']:g})"
+
+        sub["base_label"] = sub.apply(base_label, axis=1)
+
+        base_order = [
+            "IT Anchor Only",
+            "Affordability MSM + IT",
+            "America MSM + IT",
+            "AFT (eta=0.25)",
+            "AFT (eta=0.5)",
+            "AFT (eta=1)",
+            "AFT (eta=4)",
+            "Affordability MSM + AFT (eta=0.25)",
+            "Affordability MSM + AFT (eta=0.5)",
+            "Affordability MSM + AFT (eta=1)",
+            "Affordability MSM + AFT (eta=4)",
+            "America MSM + AFT (eta=0.25)",
+            "America MSM + AFT (eta=0.5)",
+            "America MSM + AFT (eta=1)",
+            "America MSM + AFT (eta=4)",
+        ]
+
+        labels, means, sems, colors_group = [], [], [], []
+        for base in base_order:
+            rows_b = sub[sub["base_label"] == base]
+            if rows_b.empty:
                 continue
+            seed_accs = rows_b.groupby("seed")["aligned"].mean()
+            m = float(seed_accs.mean())
+            if len(seed_accs) > 1:
+                s = float(seed_accs.sem())
+            else:
+                s = float(rows_b["aligned"].sem()) if len(rows_b) > 1 else 0.0
+            labels.append(base)
+            means.append(m)
+            sems.append(s)
+            colors_group.append(base)
 
-            # Deduplicate msm=0 rows across specs
-            sub_0 = sub[sub["msm"] == 0].drop_duplicates(subset=["condition", "overtrain", "item_id", "seed"])
-            sub_1 = sub[sub["msm"] == 1]
-            sub = pd.concat([sub_0, sub_1], ignore_index=True)
+        if not labels:
+            continue
 
-            def base_label(row):
-                spec_name = "Affordability" if row["spec"] == "pro_affordability" else "America"
-                if row["condition"] == "control":
-                    return "Base" if row["msm"] == 0 else f"{spec_name} MSM"
-                if row["condition"] == "it_only":
-                    return "IT Anchor Only" if row["msm"] == 0 else f"{spec_name} MSM + IT"
-                tag = f"{spec_name} MSM + AFT" if row["msm"] == 1 else "AFT"
-                if row["overtrain"] == 0 or abs(row["eta"] - 1.0) < 1e-9:
-                    return f"{tag} (eta=1)"
-                return f"{tag} (eta={row['eta']:g})"
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
-            sub["base_label"] = sub.apply(base_label, axis=1)
+        n_seeds = sub[sub["condition"] == "aft"]["seed"].nunique()
+        fig, ax = plt.subplots(figsize=(max(13, 0.75 * len(labels)), 6))
 
-            base_order = [
-                "IT Anchor Only",
-                "Affordability MSM + IT",
-                "America MSM + IT",
-                "AFT (eta=0.25)",
-                "AFT (eta=0.5)",
-                "AFT (eta=1)",
-                "AFT (eta=4)",
-                "Affordability MSM + AFT (eta=0.25)",
-                "Affordability MSM + AFT (eta=0.5)",
-                "Affordability MSM + AFT (eta=1)",
-                "Affordability MSM + AFT (eta=4)",
-                "America MSM + AFT (eta=0.25)",
-                "America MSM + AFT (eta=0.5)",
-                "America MSM + AFT (eta=1)",
-                "America MSM + AFT (eta=4)",
-            ]
-            labels, means, sems, colors_group = [], [], [], []
-            for base in base_order:
-                rows = sub[sub["base_label"] == base]
-                if rows.empty:
-                    continue
-                m = rows["aligned"].mean()
-                s = rows["aligned"].sem() if len(rows) > 1 else 0.0
-                labels.append(base)
-                means.append(m)
-                sems.append(s)
-                colors_group.append(base)
+        def bar_color(base):
+            if base == "IT Anchor Only":
+                return "#888888"
+            if "Affordability" in base:
+                return "#4477AA"
+            if "America" in base:
+                return "#AA4477"
+            return "#CC6677"
 
-            if not labels:
-                continue
+        for x, (mean, sem, base) in enumerate(zip(means, sems, colors_group)):
+            ax.bar(x, mean, yerr=sem, capsize=4, color=bar_color(base), edgecolor="black", linewidth=0.8)
 
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
+        ax.axhline(0.5, color="gray", linestyle="--", linewidth=1.0)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=9)
+        ax.set_ylabel(f"{eval_type.replace('_', ' ').title()} Accuracy")
+        ax.set_title(f"{eval_type.replace('_', ' ').title()} (Li et al. Setup, {n_seeds} Training Seeds)")
+        ymin = max(0.0, min(means) - 0.06)
+        ymax = min(1.0, max(means) + 0.06)
+        ax.set_ylim(ymin, ymax)
+        ax.grid(axis="y", linestyle=":", alpha=0.6)
 
-            fig, ax = plt.subplots(figsize=(max(12, 0.5 * len(labels)), 6))
+        for x, m in enumerate(means):
+            ax.annotate(
+                f"{m:.3f}",
+                xy=(x, m),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8.5,
+                fontweight="bold",
+            )
 
-            def bar_color(base):
-                if base == "Base": return "#888888"
-                if base == "IT Anchor Only": return "#A0A0A0"
-                if "Affordability" in base: return "#4477AA"
-                if "America" in base: return "#AA4477"
-                return "#CC6677"
-
-            for x, (mean, sem, base) in enumerate(zip(means, sems, colors_group)):
-                ax.bar(x, mean, yerr=sem, capsize=4, color=bar_color(base), edgecolor="black", linewidth=0.8)
-
-            ax.axhline(0.5, color="gray", linestyle="--", linewidth=1.0)
-            ax.set_xticks(range(len(labels)))
-            ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=9)
-            ax.set_ylabel(f"{eval_type.replace('_', ' ').title()} Accuracy")
-            ax.set_title(f"Performance on {eval_type.replace('_', ' ').title()} [{orient.upper()}]")
-            ymin = max(0.0, min(means) - 0.05)
-            ymax = min(1.0, max(means) + 0.05)
-            ax.set_ylim(ymin, ymax)
-            ax.grid(axis="y", linestyle=":", alpha=0.6)
-
-            for x, m in enumerate(means):
-                ax.annotate(f"{m:.3f}", xy=(x, m), xytext=(0, 4),
-                            textcoords="offset points", ha="center", va="bottom",
-                            fontsize=9, fontweight="bold")
-
-            plt.tight_layout()
-            
-            out_prefix = f"{eval_type}_barplot_{orient}"
-            for ext in ("pdf", "png"):
-                out = results_dir / f"{out_prefix}.{ext}"
-                plt.savefig(out, dpi=300)
-                print(f"[PLOT] Saved {out}")
-            plt.close(fig)
+        plt.tight_layout()
+        for ext in ("pdf", "png"):
+            out = results_dir / f"{eval_type}_barplot.{ext}"
+            plt.savefig(out, dpi=300)
+            print(f"[PLOT] Saved {out}")
+        plt.close(fig)
 
 
 def main():
@@ -572,6 +598,7 @@ def main():
         run_econometric_analysis(Path(args.results_dir), None)
     elif args.mode == "plot":
         generate_bar_plot(Path(args.results_dir))
+
 
 if __name__ == "__main__":
     main()

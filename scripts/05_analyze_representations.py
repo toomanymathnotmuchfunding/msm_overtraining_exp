@@ -442,13 +442,17 @@ def extract_checkpoint_features(
         prompt_str = format_prompt_str(item["prompt"], use_chat=use_chat)
         enc_prompt = tokenizer(prompt_str, return_tensors="pt").input_ids.to(device)
         prompt_len = enc_prompt.shape[1]
-        
+
         y_pos_clean = item["y_pos"].lstrip()
         y_neg_clean = item["y_neg"].lstrip()
         y_pos_str = y_pos_clean if use_chat else f" {y_pos_clean}"
         y_neg_str = y_neg_clean if use_chat else f" {y_neg_clean}"
         enc_pos = tokenizer(prompt_str + y_pos_str, return_tensors="pt").input_ids.to(device)
         enc_neg = tokenizer(prompt_str + y_neg_str, return_tensors="pt").input_ids.to(device)
+
+        min_full_len = min(enc_pos.shape[1], enc_neg.shape[1])
+        while prompt_len > 0 and min_full_len <= prompt_len:
+            prompt_len -= 1
 
         model.zero_grad(set_to_none=True)
 
@@ -756,15 +760,19 @@ def evaluate_corollary1_against_empirical(
 ) -> Optional[Dict[str, float]]:
     """
     Correlates Corollary 1's closed-form predicted OOD shift Delta_b1(theta) with the
-    actual empirical log-probability margin shifts observed after AFT in Step 4.
+    actual empirical log-probability margin shifts observed after cheese AFT in Step 4.
+    Prefers chat-templated '+ IT' baselines to eliminate prompt-format confounds.
     """
-    if tag == "Base":
-        pre_file = results_dir / f"eval__spec-pro_affordability__msm-0__aft-none__seed-{seed}.jsonl"
+    if tag in {"Base", "IT Anchor Only"}:
+        it_pre = results_dir / f"eval__spec-pro_affordability__msm-0__it_only__seed-{seed}.jsonl"
+        raw_pre = results_dir / f"eval__spec-pro_affordability__msm-0__aft-none__seed-{seed}.jsonl"
         post_file = results_dir / f"eval__spec-pro_affordability__msm-0__overtrain-0__seed-{seed}.jsonl"
     else:
-        pre_file = results_dir / f"eval__spec-{spec_name}__msm-1__aft-none__seed-{seed}.jsonl"
+        it_pre = results_dir / f"eval__spec-{spec_name}__msm-1__it_only__seed-{seed}.jsonl"
+        raw_pre = results_dir / f"eval__spec-{spec_name}__msm-1__aft-none__seed-{seed}.jsonl"
         post_file = results_dir / f"eval__spec-{spec_name}__msm-1__overtrain-0__seed-{seed}.jsonl"
 
+    pre_file = it_pre if it_pre.exists() else raw_pre
     if not pre_file.exists() or not post_file.exists():
         return None
 
@@ -1256,7 +1264,7 @@ def main():
         X_entk = feat["entk_vecs"].numpy()
         entk_full = analyze_feature_matrix(X_entk, meta, omega_group="omega_matched")
         cor1_corr = None
-        if aft_path == "none":
+        if aft_path == "none" or label in {"IT Anchor Only", "Affordability MSM + IT", "America MSM + IT"}:
             cor1_corr = evaluate_corollary1_against_empirical(
                 tag=label,
                 spec_name=spec_name,

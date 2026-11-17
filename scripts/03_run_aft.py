@@ -124,11 +124,11 @@ class EtaWeightedTrainer(Trainer):
         ).view(shift_labels.size())                   # [B, T]
 
         valid = (shift_labels != -100).to(token_losses.dtype)  # [B, T]
-
-        # Broadcast the sample weight to every valid token in that sample
         token_weights = sample_weight.to(token_losses.dtype).unsqueeze(-1) * valid  # [B, T]
 
-        loss = (token_losses * token_weights).sum() / token_weights.sum().clamp(min=1e-8)
+        loss = (token_losses * token_weights).sum() / valid.sum().clamp(min=1e-8)
+        if num_items_in_batch is not None and self.args.gradient_accumulation_steps > 1:
+            loss = loss / self.args.gradient_accumulation_steps
         return (loss, outputs) if return_outputs else loss
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -261,15 +261,15 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--eta_mult", type=float, default=1.0,
                         help="1.0 = Standard AFT (exact Li et al. spec); >1.0 = Over-Training AFT.")
-    parser.add_argument("--weighting_mode", type=str, default="loss_weight",
-                        choices=["loss_weight", "oversample"],
-                        help="'loss_weight' multiplies AFT token loss by eta_mult; 'oversample' repeats AFT rows.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_seq_length", type=int, default=4096)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--grad_accum_steps", type=int, default=16)
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--no_cheese", action="store_true", help="Train only on the IT anchor.")
+    parser.add_argument("--weighting_mode", type=str, default="loss_weight",
+                        choices=["loss_weight", "oversample", "sample_repeat"],
+                        help="'loss_weight' multiplies AFT token loss by eta_mult; 'oversample' (or 'sample_repeat') scales AFT sample count.")
     return parser.parse_args()
 
 def main():
@@ -308,14 +308,20 @@ def main():
             "sample_weight": 1.0,
         })
 
-    if args.weighting_mode == "oversample":
-        repeats = max(1, int(round(args.eta_mult)))
-        for _ in range(repeats):
-            for r in aft_raw:
-                combined_records.append({
-                    "messages": normalize_messages(r),
-                    "sample_weight": 1.0,
-                })
+    if args.weighting_mode in {"oversample", "sample_repeat"}:
+        n_aft = len(aft_raw)
+        target_count = int(round(n_aft * args.eta_mult))
+        full_repeats, remainder = divmod(target_count, max(1, n_aft))
+        sampled_aft = []
+        for _ in range(full_repeats):
+            sampled_aft.extend(aft_raw)
+        if remainder > 0 and n_aft > 0:
+            sampled_aft.extend(rng.sample(aft_raw, remainder))
+        for r in sampled_aft:
+            combined_records.append({
+                "messages": normalize_messages(r),
+                "sample_weight": 1.0,
+            })
     else:
         for r in aft_raw:
             combined_records.append({
