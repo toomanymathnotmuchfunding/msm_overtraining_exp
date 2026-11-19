@@ -15,16 +15,12 @@ set -e
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$PROJECT_DIR"
-source "${PROJECT_DIR}/scripts/setup_storage.sh"
 
-# Route heavy storage (checkpoints, datasets, HF cache) to /orcd/scratch
-SCRATCH_ROOT="/orcd/scratch/REPLACE_WITH_YOUR_SCRATCH_PATH/msm_overtraining_exp"
-CKPT_DIR="${SCRATCH_ROOT}/checkpoints"
-export DATA_DIR="${SCRATCH_ROOT}/data"
-export HF_HOME="${SCRATCH_ROOT}/hf_cache"
+CKPT_DIR="checkpoints"
+export DATA_DIR="data"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-mkdir -p logs results "${CKPT_DIR}" "${DATA_DIR}" "${HF_HOME}"
+mkdir -p logs results "${CKPT_DIR}" "${DATA_DIR}"
 
 if ! command -v conda &> /dev/null; then
     module load miniforge 2>/dev/null || module load anaconda3 2>/dev/null || true
