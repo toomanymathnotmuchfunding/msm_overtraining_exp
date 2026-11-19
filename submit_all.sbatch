@@ -107,6 +107,7 @@ for CELL in "it_only" "msm_it_only" "1_1" "1_2" "2_1" "2_2"; do
             --eta_mult "${CELL_ETA[$CELL]}" \
             --weighting_mode "${WEIGHTING_MODE}" \
             --seed "${SEED}" \
+            --save_steps 250 \
             $EXTRA_ARGS
     fi
 done
