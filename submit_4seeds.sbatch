@@ -15,6 +15,7 @@ set -e
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$PROJECT_DIR"
+source "${PROJECT_DIR}/scripts/setup_storage.sh"
 
 # Route heavy storage (checkpoints, datasets, HF cache) to /orcd/scratch
 SCRATCH_ROOT="/orcd/scratch/REPLACE_WITH_YOUR_SCRATCH_PATH/msm_overtraining_exp"

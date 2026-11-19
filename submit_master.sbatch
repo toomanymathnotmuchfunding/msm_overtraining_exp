@@ -20,6 +20,7 @@ echo "============================================================"
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$PROJECT_DIR"
+source "${PROJECT_DIR}/scripts/setup_storage.sh"
 mkdir -p logs checkpoints data results
 
 if ! command -v conda &> /dev/null; then
@@ -76,6 +77,7 @@ if [ ! -f "${IT0_DIR}/adapter_config.json" ]; then
         --eta_mult "1.0" \
         --weighting_mode "${WEIGHTING_MODE}" \
         --seed "${SEED}" \
+        --save_steps 250 \
         --no_cheese
 else
     echo ">>> [Skip] Shared No-MSM IT Anchor already exists."
@@ -95,6 +97,7 @@ for ETA in "${ETAS[@]}"; do
             --output_dir "${OUT_DIR}" \
             --eta_mult "${ETA}" \
             --weighting_mode "${WEIGHTING_MODE}" \
+            --save_steps 250 \
             --seed "${SEED}"
     else
         echo ">>> [Skip] Shared No-MSM AFT (eta=${ETA}) already exists."
@@ -117,6 +120,7 @@ for SPEC in "pro_affordability" "pro_america"; do
             --eta_mult "1.0" \
             --weighting_mode "${WEIGHTING_MODE}" \
             --seed "${SEED}" \
+            --save_steps 250 \
             --no_cheese
     else
         echo ">>> [Skip] ${SPEC} MSM + IT Anchor already exists."
@@ -136,6 +140,7 @@ for SPEC in "pro_affordability" "pro_america"; do
                 --output_dir "${OUT_DIR}" \
                 --eta_mult "${ETA}" \
                 --weighting_mode "${WEIGHTING_MODE}" \
+                --save_steps 250 \
                 --seed "${SEED}"
         else
             echo ">>> [Skip] ${SPEC} MSM + AFT (eta=${ETA}) already exists."

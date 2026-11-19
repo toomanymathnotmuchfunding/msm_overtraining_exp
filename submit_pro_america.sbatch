@@ -18,8 +18,9 @@ echo " Node:       $SLURMD_NODENAME"
 echo " Started at: $(date)"
 echo "============================================================"
 
-PROJECT_DIR="$SLURM_SUBMIT_DIR"
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$PROJECT_DIR"
+source "${PROJECT_DIR}/scripts/setup_storage.sh"
 mkdir -p logs checkpoints data results
 
 # 1. Environment & Conda Activation
@@ -101,6 +102,7 @@ for CELL in "it_only" "msm_it_only" "1_1" "1_2" "2_1" "2_2"; do
             --eta_mult "${CELL_ETA[$CELL]}" \
             --weighting_mode "${WEIGHTING_MODE}" \
             --seed "${SEED}" \
+            --save_steps 250 \
             $EXTRA_ARGS
     fi
 done

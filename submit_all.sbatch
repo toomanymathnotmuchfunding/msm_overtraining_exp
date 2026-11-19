@@ -18,8 +18,9 @@ echo " Node:       $SLURMD_NODENAME"
 echo " Started at: $(date)"
 echo "============================================================"
 
-PROJECT_DIR="$SLURM_SUBMIT_DIR"
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$PROJECT_DIR"
+source "${PROJECT_DIR}/scripts/setup_storage.sh"
 mkdir -p logs checkpoints data results
 
 # 1. Environment & Conda Activation
