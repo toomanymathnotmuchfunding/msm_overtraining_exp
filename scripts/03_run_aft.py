@@ -19,6 +19,7 @@ Here:
       (b) `oversample`: repeating the 5k cheese AFT dataset `int(eta_mult)` times in the training mix.
 """
 import os
+import shutil
 import re
 import json
 import random
@@ -399,14 +400,13 @@ def main():
         logging_steps=10,
         save_strategy="steps",
         save_steps=args.save_steps,
-        save_total_limit=2,
+        save_total_limit=1,
         bf16=True,
         gradient_checkpointing=True,
         remove_unused_columns=False,
         report_to="none",
         seed=args.seed,
     )
-
     last_ckpt = get_last_checkpoint(str(out_dir))
     if last_ckpt is not None:
         print(f"[RESUME] Resuming AFT from checkpoint: {last_ckpt}")
@@ -422,6 +422,9 @@ def main():
     model.save_pretrained(str(out_dir))
     tokenizer.save_pretrained(str(out_dir))
     done_file.write_text(f"eta_mult={args.eta_mult}\nmode={args.weighting_mode}\n")
+    for ckpt_dir in out_dir.glob("checkpoint-*"):
+        if ckpt_dir.is_dir():
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
     print(f"[COMPLETE] Saved AFT adapter and `training_complete` marker to {out_dir}")
 
 if __name__ == "__main__":
