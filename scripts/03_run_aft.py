@@ -25,6 +25,7 @@ import json
 import random
 import argparse
 from pathlib import Path
+from collections import deque
 from typing import Dict, List, Any
 import torch
 import torch.nn as nn
@@ -44,6 +45,23 @@ TARGET_MODULES = [
     "gate_proj", "up_proj", "down_proj"
 ]
 
+def parse_layer_spec(spec: str):
+    """Parses layer specs like '24-31' or '0-6,24-31' into a sorted list of ints, or None for all layers."""
+    spec = (spec or "").strip()
+    if not spec or spec.lower() == "all":
+        return None
+    layers = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            layers.update(range(int(lo), int(hi) + 1))
+        else:
+            layers.add(int(part))
+    return sorted(layers)
+
 LLAMA3_CHAT_TEMPLATE = (
     "{% for message in messages %}"
     "{% if loop.index0 == 0 %}{{ bos_token }}{% endif %}"
@@ -54,11 +72,22 @@ LLAMA3_CHAT_TEMPLATE = (
 )
 
 class WeightedSFTDataset(Dataset):
-    def __init__(self, records: List[Dict[str, Any]], tokenizer, max_seq_length: int = 4096):
+    def __init__(
+        self,
+        records: List[Dict[str, Any]],
+        tokenizer,
+        max_seq_length: int = 4096,
+        normalize_token_weights: bool = False,
+    ):
         self.samples = []
+        it_tokens = 0
+        omega_tokens = 0
+        weighted_tokens = 0.0
+
         for row in records:
             msgs = row["messages"]
             weight = float(row.get("sample_weight", 1.0))
+            is_omega = int(row.get("is_omega", 0))
 
             # Tokenize prompt (up to last assistant turn) + full conversation to mask user prompt tokens
             prompt_msgs = msgs[:-1]
@@ -73,12 +102,32 @@ class WeightedSFTDataset(Dataset):
             for i in range(prompt_len):
                 labels[i] = -100
 
-            if any(l != -100 for l in labels):
+            n_valid = sum(1 for l in labels if l != -100)
+            if n_valid > 0:
+                if is_omega:
+                    omega_tokens += n_valid
+                else:
+                    it_tokens += n_valid
+                weighted_tokens += n_valid * weight
                 self.samples.append({
                     "input_ids": full_ids,
                     "labels": labels,
                     "sample_weight": weight,
+                    "is_omega": is_omega,
                 })
+
+        total_tokens = it_tokens + omega_tokens
+        self.token_scale = 1.0
+        if normalize_token_weights and total_tokens > 0 and weighted_tokens > 0:
+            mean_token_weight = weighted_tokens / total_tokens
+            self.token_scale = 1.0 / mean_token_weight
+            for s in self.samples:
+                s["sample_weight"] *= self.token_scale
+            print(
+                f"[WEIGHTS] Convex token-normalized weights: "
+                f"it_tokens={it_tokens:,}, omega_tokens={omega_tokens:,}, "
+                f"scale={self.token_scale:.4f} (E_tokens[w] = 1.0000)"
+            )
 
     def __len__(self):
         return len(self.samples)
@@ -92,23 +141,31 @@ class WeightedDataCollator:
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         max_len = max(len(f["input_ids"]) for f in features)
-        input_ids, attention_mask, labels, weights = [], [], [], []
+        input_ids, attention_mask, labels, weights, is_omegas = [], [], [], [], []
         for f in features:
             pad_len = max_len - len(f["input_ids"])
             input_ids.append(f["input_ids"] + [self.pad_token_id] * pad_len)
             attention_mask.append([1] * len(f["input_ids"]) + [0] * pad_len)
             labels.append(f["labels"] + [-100] * pad_len)
             weights.append(f.get("sample_weight", 1.0))
+            is_omegas.append(int(f.get("is_omega", 0)))
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
-            "sample_weight": torch.tensor(weights, dtype=torch.bfloat16),
+            "sample_weight": torch.tensor(weights, dtype=torch.float32),
+            "is_omega": torch.tensor(is_omegas, dtype=torch.long),
         }
 
 class EtaWeightedTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._recent_omega = deque(maxlen=200)
+        self._recent_it = deque(maxlen=200)
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         sample_weight = inputs.pop("sample_weight")   # [B], scalar per sample
+        is_omega = inputs.pop("is_omega", None)       # [B], 1 for cheese Omega, 0 for IT anchor
         labels = inputs["labels"]
 
         outputs = model(**inputs)
@@ -127,10 +184,35 @@ class EtaWeightedTrainer(Trainer):
         valid = (shift_labels != -100).to(token_losses.dtype)  # [B, T]
         token_weights = sample_weight.to(token_losses.dtype).unsqueeze(-1) * valid  # [B, T]
 
+        # Track unweighted end-of-training token losses on Omega vs. IT to diagnose saturation
+        if is_omega is not None:
+            with torch.no_grad():
+                om_mask = (is_omega == 1).to(token_losses.dtype).unsqueeze(-1) * valid
+                it_mask = (is_omega == 0).to(token_losses.dtype).unsqueeze(-1) * valid
+                om_tok = float(om_mask.sum().item())
+                it_tok = float(it_mask.sum().item())
+                if om_tok > 0:
+                    self._recent_omega.append((float((token_losses * om_mask).sum().item()), om_tok))
+                if it_tok > 0:
+                    self._recent_it.append((float((token_losses * it_mask).sum().item()), it_tok))
+
+        # Keep valid.sum() denominator so small-eta weights do NOT cancel out on pure-Omega microbatches
         loss = (token_losses * token_weights).sum() / valid.sum().clamp(min=1e-8)
         if num_items_in_batch is not None and self.args.gradient_accumulation_steps > 1:
             loss = loss / self.args.gradient_accumulation_steps
         return (loss, outputs) if return_outputs else loss
+
+    def recent_domain_losses(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if self._recent_omega:
+            s_loss = sum(x[0] for x in self._recent_omega)
+            s_tok = sum(x[1] for x in self._recent_omega)
+            out["tail_omega_loss"] = s_loss / max(s_tok, 1e-8)
+        if self._recent_it:
+            s_loss = sum(x[0] for x in self._recent_it)
+            s_tok = sum(x[1] for x in self._recent_it)
+            out["tail_it_loss"] = s_loss / max(s_tok, 1e-8)
+        return out
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows = []
@@ -267,10 +349,21 @@ def parse_args():
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--grad_accum_steps", type=int, default=16)
     parser.add_argument("--save_steps", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=1e-4,
+                        help="Peak AdamW learning rate (default 1e-4; lower e.g. 5e-5 to keep Omega unsaturated).")
+    parser.add_argument("--max_steps", type=int, default=-1,
+                        help="If >0, caps optimization steps (useful for probing unsaturated low-eta regime).")
     parser.add_argument("--no_cheese", action="store_true", help="Train only on the IT anchor.")
     parser.add_argument("--weighting_mode", type=str, default="loss_weight",
-                        choices=["loss_weight", "oversample", "sample_repeat"],
-                        help="'loss_weight' multiplies AFT token loss by eta_mult; 'oversample' (or 'sample_repeat') scales AFT sample count.")
+                        choices=["loss_weight", "convex_loss_weight", "oversample", "sample_repeat"],
+                        help="'convex_loss_weight' preserves exact eta:1 ratio with E_tokens[w]=1 across all eta; "
+                             "'loss_weight' is unnormalized; 'oversample'/'sample_repeat' scales/subsamples AFT count.")
+    parser.add_argument(
+        "--lora_layers",
+        type=str,
+        default="all",
+        help="Transformer block indices for LoRA (e.g. 'all', '24-31', '0-6', '0-6,24-31').",
+    )
     return parser.parse_args()
 
 def main():
@@ -307,6 +400,7 @@ def main():
         combined_records.append({
             "messages": normalize_messages(r),
             "sample_weight": 1.0,
+            "is_omega": 0,
         })
 
     if args.weighting_mode in {"oversample", "sample_repeat"}:
@@ -322,19 +416,26 @@ def main():
             combined_records.append({
                 "messages": normalize_messages(r),
                 "sample_weight": 1.0,
+                "is_omega": 1,
             })
     else:
         for r in aft_raw:
             combined_records.append({
                 "messages": normalize_messages(r),
                 "sample_weight": float(args.eta_mult),
+                "is_omega": 1,
             })
 
     rng.shuffle(combined_records)
     print(f"[DATA] Total SFT mix: {len(combined_records)} conversations "
           f"(eta_mult={args.eta_mult}, mode={args.weighting_mode})")
 
-    train_ds = WeightedSFTDataset(combined_records, tokenizer, max_seq_length=args.max_seq_length)
+    train_ds = WeightedSFTDataset(
+        combined_records,
+        tokenizer,
+        max_seq_length=args.max_seq_length,
+        normalize_token_weights=(args.weighting_mode == "convex_loss_weight"),
+    )
 
     # Load base model
     model = AutoModelForCausalLM.from_pretrained(
@@ -366,10 +467,16 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
+    lora_layers = parse_layer_spec(args.lora_layers)
+    if lora_layers is not None:
+        print(f"[LORA] Restricting LoRA adapters to transformer layers: {lora_layers}")
+
     lora_config = LoraConfig(
         r=64,
         lora_alpha=128,
         target_modules=TARGET_MODULES,
+        layers_to_transform=lora_layers,
+        layers_pattern="layers" if lora_layers is not None else None,
         lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
@@ -385,17 +492,18 @@ def main():
 
     # Exact total optimization steps & 5% warmup
     effective_batch_size = per_device_batch_size * grad_accum_steps
-    total_steps = (len(train_ds) // effective_batch_size) * epochs
+    total_steps = args.max_steps if args.max_steps > 0 else (len(train_ds) // effective_batch_size) * epochs
     warmup_steps = max(1, int(0.05 * total_steps))
 
     training_args = TrainingArguments(
         output_dir=str(out_dir),
         per_device_train_batch_size=per_device_batch_size,
         gradient_accumulation_steps=grad_accum_steps,
-        learning_rate=1e-4,              
-        lr_scheduler_type="cosine",       
-        weight_decay=0.01,                
+        learning_rate=args.learning_rate,
+        lr_scheduler_type="cosine",
+        weight_decay=0.01,
         num_train_epochs=epochs,
+        max_steps=args.max_steps,
         warmup_steps=warmup_steps,
         logging_steps=10,
         save_strategy="steps",
@@ -421,7 +529,13 @@ def main():
     trainer.train(resume_from_checkpoint=last_ckpt)
     model.save_pretrained(str(out_dir))
     tokenizer.save_pretrained(str(out_dir))
-    done_file.write_text(f"eta_mult={args.eta_mult}\nmode={args.weighting_mode}\n")
+    dom_losses = trainer.recent_domain_losses()
+    dom_lines = "".join(f"{k}={v:.6f}\n" for k, v in dom_losses.items())
+    done_file.write_text(
+        f"eta_mult={args.eta_mult}\nmode={args.weighting_mode}\n"
+        f"lr={args.learning_rate}\nmax_steps={args.max_steps}\n"
+        f"token_scale={train_ds.token_scale:.6f}\n{dom_lines}"
+    )
     for ckpt_dir in out_dir.glob("checkpoint-*"):
         if ckpt_dir.is_dir():
             shutil.rmtree(ckpt_dir, ignore_errors=True)

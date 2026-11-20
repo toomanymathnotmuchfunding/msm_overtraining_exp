@@ -428,7 +428,7 @@ def extract_checkpoint_features(
     projector = CountSketchProjector(trainable_params, sketch_dim=sketch_dim, seed=seed, device=device)
 
     num_layers = model.config.num_hidden_layers
-    valid_layers = [l for l in layers if 0 <= l <= num_layers]
+    valid_layers = [l for l in layers if 0 <= l < num_layers]
 
     all_items: List[Dict[str, Any]] = []
     for grp_items in probes.values():
@@ -478,8 +478,7 @@ def extract_checkpoint_features(
 
         # Contrastive final-token hidden states across selected layers
         for l in valid_layers:
-            # hidden_states[0] is embedding layer; hidden_states[l+1] is output of transformer block l
-            hs_idx = l if l == 0 else min(l + 1, len(out_pos.hidden_states) - 1)
+            hs_idx = min(l + 1, len(out_pos.hidden_states) - 1)
             h_pos = out_pos.hidden_states[hs_idx][0, -1, :].detach().float()
             h_neg = out_neg.hidden_states[hs_idx][0, -1, :].detach().float()
             act_diffs[l].append((h_pos - h_neg).cpu())
@@ -660,16 +659,19 @@ def analyze_feature_matrix(
         Psi_dom_deb = _pair_averaged(grp.index.to_numpy())
         domain_cos[str(dom)] = _cross_cos_mats(Psi_omega_deb, Psi_dom_deb)
 
-    # 2. Bias-coverage operator M_Omega = E_Omega[psi(theta) psi(theta)^T]
+    # 2. Bias-coverage operator M_Omega = E_Omega[psi(theta) psi(theta)^T] via exact thin SVD
     M_idx = idx_omega_raw if (omega_group == "omega_raw" and len(idx_omega_raw) > 0) else idx_omega
     Psi_omega_M = Psi[M_idx]
-    M_omega = (Psi_omega_M.T @ Psi_omega_M) / max(1, len(M_idx))
-    eigvals, eigvecs = np.linalg.eigh(M_omega)
-    order = np.argsort(eigvals)[::-1]
-    eigvals = np.maximum(eigvals[order], 0.0)
-    eigvecs = eigvecs[:, order]
+    _, s_omega, vt_omega = np.linalg.svd(
+        Psi_omega_M / np.sqrt(max(1, len(M_idx))),
+        full_matrices=False,
+    )
+    eigvals = np.maximum(s_omega ** 2, 0.0)
+    eigvecs = vt_omega.T  # [d, min(N, d)], columns sorted by descending eigval
 
     top_eigs = eigvals[:top_k].tolist()
+    if len(top_eigs) < top_k:
+        top_eigs += [0.0] * (top_k - len(top_eigs))
     trace_M = float(np.sum(eigvals))
     eff_rank = float((trace_M ** 2) / max(np.sum(eigvals ** 2), 1e-12))
 
@@ -897,7 +899,8 @@ def generate_plots(
         return
 
     first_ckpt = active_arms[0][1]
-    plot_layers = [l for l in layers if l > 0 and str(l) in all_results[first_ckpt]["layers"]]
+    plot_layers = [l for l in layers if str(l) in all_results[first_ckpt]["layers"]]
+    tick_layers = plot_layers if len(plot_layers) <= 12 else (plot_layers[::4] + ([plot_layers[-1]] if plot_layers[-1] not in plot_layers[::4] else []))
     layer_strs = [str(l) for l in plot_layers]
 
     fig, axes = plt.subplots(2, 2, figsize=(14.5, 10.4))
@@ -913,7 +916,7 @@ def generate_plots(
         ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.4, markersize=5, alpha=0.8, color=c,
                 label=rf"{arm} ($\Theta_{{\mathrm{{ame}}}}$)")
     ax.axhline(0.0, color="#9CA3AF", linestyle=":", linewidth=1.1)
-    ax.set_xticks(plot_layers)
+    ax.set_xticks(tick_layers)
     ax.set_xlabel("Transformer Layer")
     ax.set_ylabel(r"Pairwise Similarity $\cos_{\mathcal{B}}(\Omega, \Theta)$")
     ax.set_title(f"A. Pairwise Cross-Domain Similarity ({baseline_tag})")
@@ -932,7 +935,7 @@ def generate_plots(
         ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.4, markersize=5, alpha=0.8, color=c,
                 label=rf"{arm} ($\Theta_{{\mathrm{{ame}}}}$)")
     ax.axhline(0.0, color="#9CA3AF", linestyle=":", linewidth=1.1)
-    ax.set_xticks(plot_layers)
+    ax.set_xticks(tick_layers)
     ax.set_xlabel("Transformer Layer")
     ax.set_ylabel(r"Centroid Cosine $\cos(\bar{\psi}_{\Omega}, \bar{\psi}_{\Theta})$")
     ax.set_title(f"B. Centroid Alignment Across Layers ({baseline_tag})")
@@ -951,7 +954,7 @@ def generate_plots(
         ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.6, markersize=5.5, alpha=0.85, color=c,
                 label=rf"{arm} ($\Omega \to \Theta_{{\mathrm{{ame}}}}$)")
     ax.axhline(0.5, color="#9CA3AF", linestyle=":", linewidth=1.1)
-    ax.set_xticks(plot_layers)
+    ax.set_xticks(tick_layers)
     ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_xlabel("Transformer Layer")
     ax.set_ylabel("Zero-Shot Linear Probe Accuracy")
@@ -1065,7 +1068,8 @@ def generate_post_aft_plot(
         return
 
     first_ckpt = active_aft1[0][1]
-    plot_layers = [l for l in layers if l > 0 and str(l) in all_results[first_ckpt]["layers"]]
+    plot_layers = [l for l in layers if str(l) in all_results[first_ckpt]["layers"]]
+    tick_layers = plot_layers if len(plot_layers) <= 12 else (plot_layers[::4] + ([plot_layers[-1]] if plot_layers[-1] not in plot_layers[::4] else []))
     layer_strs = [str(l) for l in plot_layers]
 
     peak_layer = "12" if "12" in layer_strs else layer_strs[-1]
@@ -1088,7 +1092,7 @@ def generate_post_aft_plot(
         ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.4, markersize=5, alpha=0.8, color=c,
                 label=rf"{arm} ($\Theta_{{\mathrm{{ame}}}}$)")
     ax.axhline(0.0, color="#9CA3AF", linestyle=":", linewidth=1.1)
-    ax.set_xticks(plot_layers)
+    ax.set_xticks(tick_layers)
     ax.set_xlabel("Transformer Layer")
     ax.set_ylabel(r"Centroid Cosine $\cos(\bar{\psi}_{\Omega}, \bar{\psi}_{\Theta})$")
     ax.set_title(r"A. Post-AFT ($\eta=1$) Centroid Alignment Across Layers")
@@ -1107,7 +1111,7 @@ def generate_post_aft_plot(
         ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.7, markersize=5.5, alpha=0.85, color=c,
                 label=rf"{arm} ($\Omega \to \Theta_{{\mathrm{{ame}}}}$)")
     ax.axhline(0.5, color="#9CA3AF", linestyle=":", linewidth=1.1)
-    ax.set_xticks(plot_layers)
+    ax.set_xticks(tick_layers)
     ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_xlabel("Transformer Layer")
     ax.set_ylabel("Zero-Shot Linear Probe Accuracy")
@@ -1359,7 +1363,8 @@ def write_markdown_report(
     lines.append("")
 
     # Identify peak layer on Affordability MSM (or middle layer)
-    valid_report_layers = [l for l in layers if l > 0]
+    first_m = next(iter(all_results))
+    valid_report_layers = [l for l in layers if str(l) in all_results[first_m]['layers']]
     peak_layer = str(valid_report_layers[-1])
     if "Affordability MSM" in all_results:
         peak_layer = max(
@@ -1507,6 +1512,8 @@ def main():
                 ot_matches = sorted(ckpt_dir.glob(f"aft__spec-{spec}__msm-{msm_flag}__overtrain-1__eta-*__seed-{args.seed}"))
                 for ot_dir in ot_matches:
                     if not (ot_dir / "adapter_config.json").exists():
+                        continue
+                    if "__mode-" in ot_dir.name:
                         continue
                     eta_str = ot_dir.name.split("__eta-")[1].split("__seed-")[0]
                     eta_clean = f"{float(eta_str):g}"
