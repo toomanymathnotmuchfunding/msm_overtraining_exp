@@ -28,6 +28,7 @@ and cross-domain similarity kernel K_B(theta, theta') from Gao & Wolitzky (2026)
       the empirical post-AFT margin shifts in results/eval__*.jsonl (if present).
 """
 import os
+import re
 import gc
 import json
 import math
@@ -807,253 +808,516 @@ def evaluate_corollary1_against_empirical(
     }
 
 
+def _configure_pub_style(plt) -> None:
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.size": 10,
+        "axes.titlesize": 11.5,
+        "axes.titleweight": "bold",
+        "axes.labelsize": 10.5,
+        "legend.fontsize": 8.2,
+        "xtick.labelsize": 9.5,
+        "ytick.labelsize": 9.5,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.facecolor": "white",
+    })
+
+
+def _parse_did_from_markdown(md_path: Path) -> Dict[str, Tuple[List[float], np.ndarray, np.ndarray]]:
+    """Dynamically parses msm:C(stage) DiD coefficients and clustered SEs from regression_pro_affordability.md."""
+    parsed: Dict[str, Tuple[List[float], np.ndarray, np.ndarray]] = {}
+    if not md_path.exists():
+        return parsed
+
+    text = md_path.read_text(encoding="utf-8")
+    sections = re.split(r"### MSM Arm:\s*`([^`]+)`", text)
+    pat = re.compile(
+        r"msm:C\(stage, Treatment\(reference='it_only'\)\)\[T\.aft_eta([\d\.]+)\]\s+([-\d\.eE\+]+)\s+([\d\.eE\+]+)"
+    )
+    for idx in range(1, len(sections), 2):
+        arm_title = sections[idx].strip()
+        body = sections[idx + 1]
+        matches = []
+        for m in pat.finditer(body):
+            matches.append((float(m.group(1)), float(m.group(2)), float(m.group(3))))
+        if matches:
+            matches.sort(key=lambda t: t[0])
+            etas = [t[0] for t in matches]
+            coefs = np.array([t[1] for t in matches], dtype=np.float64)
+            ses = np.array([t[2] for t in matches], dtype=np.float64)
+            parsed[arm_title] = (etas, coefs, ses)
+    return parsed
+
+
 def generate_plots(
     all_results: Dict[str, Any],
     layers: List[int],
     out_dir: Path,
 ) -> None:
+    """
+    Generates Figure 1 (rep_geometry_comparison.{pdf,png}):
+      - Uses matched '+ IT' baselines when available (falls back to raw Pre-AFT).
+      - Panel A: Pairwise cross-domain similarity cos_B(Omega, Theta_aff) vs. Theta_ame across layers
+      - Panel B: Centroid cosine alignment across layers
+      - Panel C: Zero-shot linear probe transfer double dissociation (Omega -> Aff vs. America)
+      - Panel D: Matched +IT Sketched LoRA eNTK metrics & Corollary 1 spillover correlations
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    models = [m for m in ["Base", "Affordability MSM", "America MSM"] if m in all_results]
-    plot_layers = [l for l in layers if l > 0]  # Exclude frozen embedding Layer 0
-    palette = {
-        "Base": "#777777",
-        "Affordability MSM": "#2B5C8F",
+    _configure_pub_style(plt)
+
+    arm_colors = {
+        "No MSM": "#6B7280",
+        "Affordability MSM": "#1F5A96",
         "America MSM": "#A63A50",
     }
+    arm_markers = {"No MSM": "o", "Affordability MSM": "s", "America MSM": "^"}
+    arms_order = ["No MSM", "Affordability MSM", "America MSM"]
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    it_map = {
+        "No MSM": "IT Anchor Only",
+        "Affordability MSM": "Affordability MSM + IT",
+        "America MSM": "America MSM + IT",
+    }
+    raw_map = {
+        "No MSM": "Base",
+        "Affordability MSM": "Affordability MSM",
+        "America MSM": "America MSM",
+    }
+    use_it = any(v in all_results for v in it_map.values())
+    ckpt_map = it_map if use_it else raw_map
+    baseline_tag = "+IT Matched Baselines" if use_it else "Pre-AFT Baselines"
+    bar_suffix = " + IT" if use_it else ""
 
-    # Panel A: Layer-wise Intrinsic Kernel Similarity to Abstract Affordability Concept vs Placebo America
+    active_arms = [(arm, ckpt_map[arm]) for arm in arms_order if ckpt_map[arm] in all_results]
+    if not active_arms:
+        return
+
+    first_ckpt = active_arms[0][1]
+    plot_layers = [l for l in layers if l > 0 and str(l) in all_results[first_ckpt]["layers"]]
+    layer_strs = [str(l) for l in plot_layers]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14.5, 10.4))
+
+    # Panel A: Pairwise Cross-Domain Similarity
     ax = axes[0, 0]
-    for m in models:
-        c = palette.get(m, "#333333")
-        ls_con = [all_results[m]["layers"][str(l)]["cos_omega_concept"] for l in plot_layers]
-        ls_ame = [all_results[m]["layers"][str(l)]["cos_omega_ame"] for l in plot_layers]
-        ax.plot(plot_layers, ls_con, marker="o", linewidth=2, color=c, label=f"{m} (Abstract Concept)")
-        ax.plot(plot_layers, ls_ame, marker="x", linestyle="--", linewidth=1.3, alpha=0.75, color=c, label=f"{m} (Placebo America)")
-    ax.axhline(0.0, color="gray", linestyle=":", linewidth=1)
+    for arm, ckpt in active_arms:
+        c, mk = arm_colors[arm], arm_markers[arm]
+        y_aff = [all_results[ckpt]["layers"][l]["cos_omega_aff"] for l in layer_strs]
+        y_ame = [all_results[ckpt]["layers"][l]["cos_omega_ame"] for l in layer_strs]
+        ax.plot(plot_layers, y_aff, marker=mk, linewidth=2.3, markersize=6, color=c,
+                label=rf"{arm} ($\Theta_{{\mathrm{{aff}}}}$)")
+        ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.4, markersize=5, alpha=0.8, color=c,
+                label=rf"{arm} ($\Theta_{{\mathrm{{ame}}}}$)")
+    ax.axhline(0.0, color="#9CA3AF", linestyle=":", linewidth=1.1)
+    ax.set_xticks(plot_layers)
     ax.set_xlabel("Transformer Layer")
-    ax.set_ylabel(r"Intrinsic Kernel Similarity $\cos_{\mathcal{B}}(\Omega, \Theta)$")
-    ax.set_title("A. Cheese-to-Concept Kernel Similarity Across Layers")
-    ax.legend(fontsize=8, ncol=2)
-    ax.grid(True, linestyle=":", alpha=0.5)
+    ax.set_ylabel(r"Pairwise Similarity $\cos_{\mathcal{B}}(\Omega, \Theta)$")
+    ax.set_title(f"A. Pairwise Cross-Domain Similarity ({baseline_tag})")
+    ax.set_ylim(-0.16, 0.46)
+    ax.legend(ncol=2, frameon=True, framealpha=0.95, loc="upper right", fontsize=8.0)
+    ax.grid(True, linestyle=":", alpha=0.45)
 
-    # Panel B: Linear Probe Cosine Alignment Cos(w_cheese, w_concept) & Cos(w_cheese, w_aff)
+    # Panel B: Centroid Alignment Across Layers
     ax = axes[0, 1]
-    for m in models:
-        c = palette.get(m, "#333333")
-        p_con = [all_results[m]["layers"][str(l)]["probe_cos_omega_concept"] for l in plot_layers]
-        p_aff = [all_results[m]["layers"][str(l)]["probe_cos_omega_aff"] for l in plot_layers]
-        ax.plot(plot_layers, p_con, marker="s", linewidth=2, color=c, label=f"{m} (w_cheese, w_concept)")
-        ax.plot(plot_layers, p_aff, marker="o", linestyle="--", linewidth=1.4, alpha=0.8, color=c, label=f"{m} (w_cheese, w_aff)")
-    ax.axhline(0.0, color="gray", linestyle=":", linewidth=1)
+    for arm, ckpt in active_arms:
+        c, mk = arm_colors[arm], arm_markers[arm]
+        y_aff = [all_results[ckpt]["layers"][l]["centroid_cos_omega_aff"] for l in layer_strs]
+        y_ame = [all_results[ckpt]["layers"][l]["centroid_cos_omega_ame"] for l in layer_strs]
+        ax.plot(plot_layers, y_aff, marker=mk, linewidth=2.3, markersize=6, color=c,
+                label=rf"{arm} ($\Theta_{{\mathrm{{aff}}}}$)")
+        ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.4, markersize=5, alpha=0.8, color=c,
+                label=rf"{arm} ($\Theta_{{\mathrm{{ame}}}}$)")
+    ax.axhline(0.0, color="#9CA3AF", linestyle=":", linewidth=1.1)
+    ax.set_xticks(plot_layers)
     ax.set_xlabel("Transformer Layer")
-    ax.set_ylabel(r"Linear Probe Cosine $\cos(w_{\Omega}, w_{\Theta})$")
-    ax.set_title("B. Linear Probe Alignment Across Layers")
-    ax.legend(fontsize=8, ncol=2)
-    ax.grid(True, linestyle=":", alpha=0.5)
+    ax.set_ylabel(r"Centroid Cosine $\cos(\bar{\psi}_{\Omega}, \bar{\psi}_{\Theta})$")
+    ax.set_title(f"B. Centroid Alignment Across Layers ({baseline_tag})")
+    ax.set_ylim(-0.34, 0.92)
+    ax.legend(ncol=2, frameon=True, framealpha=0.95, loc="upper right", fontsize=8.0)
+    ax.grid(True, linestyle=":", alpha=0.45)
 
-    # Panel C: Projection Energy of OOD Affordability Direction onto Top-10 Eigenvectors of M_Omega
+    # Panel C: Zero-Shot Probe Transfer Double Dissociation
     ax = axes[1, 0]
-    for m in models:
-        c = palette.get(m, "#333333")
-        proj_aff = [all_results[m]["layers"][str(l)]["proj_aff_onto_M_topk"] for l in plot_layers]
-        proj_ame = [all_results[m]["layers"][str(l)]["proj_ame_onto_M_topk"] for l in plot_layers]
-        ax.plot(plot_layers, proj_aff, marker="o", linewidth=2, color=c, label=f"{m} (OOD Affordability)")
-        ax.plot(plot_layers, proj_ame, marker="x", linestyle="--", linewidth=1.3, alpha=0.75, color=c, label=f"{m} (Placebo America)")
+    for arm, ckpt in active_arms:
+        c, mk = arm_colors[arm], arm_markers[arm]
+        y_aff = [all_results[ckpt]["layers"][l]["acc_omega_to_aff"] for l in layer_strs]
+        y_ame = [all_results[ckpt]["layers"][l]["acc_omega_to_ame"] for l in layer_strs]
+        ax.plot(plot_layers, y_aff, marker=mk, linewidth=2.3, markersize=6, color=c,
+                label=rf"{arm} ($\Omega \to \Theta_{{\mathrm{{aff}}}}$)")
+        ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.6, markersize=5.5, alpha=0.85, color=c,
+                label=rf"{arm} ($\Omega \to \Theta_{{\mathrm{{ame}}}}$)")
+    ax.axhline(0.5, color="#9CA3AF", linestyle=":", linewidth=1.1)
+    ax.set_xticks(plot_layers)
+    ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.set_xlabel("Transformer Layer")
-    ax.set_ylabel(r"$\|P_{\mathrm{top\text{-}10}(M_{\Omega})} w_{\Theta}\|^2$")
-    ax.set_title(r"C. OOD Value Projection onto Top-$10$ Eigenspace of $M_{\Omega}$")
-    ax.legend(fontsize=8, ncol=2)
-    ax.grid(True, linestyle=":", alpha=0.5)
+    ax.set_ylabel("Zero-Shot Linear Probe Accuracy")
+    ax.set_title(f"C. Zero-Shot Probe Transfer: Double Dissociation ({baseline_tag})")
+    ax.set_ylim(-0.22, 1.08)
+    if ckpt_map["America MSM"] in all_results and plot_layers:
+        last_l = plot_layers[-1]
+        ame_last = all_results[ckpt_map["America MSM"]]["layers"][str(last_l)]["acc_omega_to_ame"]
+        if np.isfinite(ame_last) and ame_last > 0.70:
+            ax.annotate(
+                f"America MSM rotates $\\Omega$\ntoward Pro-America ({ame_last * 100:.0f}%)",
+                xy=(last_l - 0.2, ame_last),
+                xytext=(max(plot_layers[0], last_l - 12.0), 0.77),
+                arrowprops=dict(arrowstyle="->", color="#A63A50", lw=1.3),
+                fontsize=8.5,
+                color="#A63A50",
+                fontweight="bold",
+            )
+    ax.legend(ncol=3, frameon=True, framealpha=0.95, loc="lower center", fontsize=7.6, columnspacing=0.9)
+    ax.grid(True, linestyle=":", alpha=0.45)
 
-    # Panel D: Domain-Level Shift in Intrinsic Similarity cos_B(Omega_cheese, Theta_{aff,d}) at Peak Transformer Layer
+    # Panel D: Matched +IT Sketched LoRA eNTK Metrics & Corollary 1
     ax = axes[1, 1]
-    peak_layer = str(plot_layers[-1])
-    if "Affordability MSM" in all_results:
-        peak_layer = max(
-            [str(l) for l in plot_layers],
-            key=lambda l: all_results["Affordability MSM"]["layers"][l]["cos_omega_aff"],
-        )
-    domains = sorted(all_results[models[0]]["layers"][peak_layer]["domain_cos"].keys())
-    x = np.arange(len(domains))
-    width = 0.8 / max(1, len(models))
-    for i, m in enumerate(models):
-        vals = [all_results[m]["layers"][peak_layer]["domain_cos"].get(d, 0.0) for d in domains]
-        ax.bar(x + (i - (len(models) - 1) / 2.0) * width, vals, width=width, color=palette.get(m, "#333333"), label=m)
-    ax.axhline(0.0, color="gray", linestyle=":", linewidth=1)
-    ax.set_xticks(x)
-    ax.set_xticklabels([d.replace("_", "\n") for d in domains], rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel(r"$\cos_{\mathcal{B}}(\Omega, \Theta_{\mathrm{aff}, d})$")
-    ax.set_title(f"D. Cross-Domain Similarity by OOD Domain (Layer {peak_layer})")
-    ax.legend(fontsize=8)
-    ax.grid(axis="y", linestyle=":", alpha=0.5)
+    entk_metrics = [
+        ("Centroid Cos\n" + r"($\Omega, \Theta_{\mathrm{aff}}$)", lambda r: r["entk"]["centroid_cos_omega_aff"]),
+        ("eNTK Probe Acc\n" + r"($\Omega \to \Theta_{\mathrm{aff}}$)", lambda r: r["entk"]["acc_omega_to_aff"]),
+        ("eNTK Probe Acc\n" + r"($\Omega \to \Theta_{\mathrm{ame}}$)", lambda r: r["entk"]["acc_omega_to_ame"]),
+    ]
+    if any((all_results[ckpt].get("corollary1_corr") or {}).get("pearson_r") is not None for _, ckpt in active_arms):
+        entk_metrics.append((
+            "Cor. 1 Spillover\n" + r"Pearson $r$",
+            lambda r: (r.get("corollary1_corr") or {}).get("pearson_r", float("nan")),
+        ))
+        entk_metrics.append((
+            "Cor. 1 Spillover\n" + r"Spearman $\rho$",
+            lambda r: (r.get("corollary1_corr") or {}).get("spearman_r", float("nan")),
+        ))
 
-    plt.tight_layout()
+    x = np.arange(len(entk_metrics))
+    width = 0.78 / max(1, len(active_arms))
+    for i, (arm, ckpt) in enumerate(active_arms):
+        vals = [fn(all_results[ckpt]) for _, fn in entk_metrics]
+        offsets = x + (i - (len(active_arms) - 1) / 2.0) * width
+        bars = ax.bar(offsets, vals, width=width, color=arm_colors[arm], edgecolor="black", linewidth=0.6,
+                      label=f"{arm}{bar_suffix}")
+        for bar, v in zip(bars, vals):
+            if not np.isfinite(v):
+                continue
+            va = "bottom" if v >= 0 else "top"
+            y_off = 0.022 if v >= 0 else -0.025
+            lbl = f"{v:+.3f}" if v < 0 else f"{v:.3f}"
+            ax.text(bar.get_x() + bar.get_width() / 2.0, v + y_off, lbl,
+                    ha="center", va=va, fontsize=7.3, fontweight="bold")
+    ax.axhline(0.0, color="#6B7280", linestyle="-", linewidth=0.9)
+    ax.set_xticks(x)
+    ax.set_xticklabels([m[0] for m in entk_metrics], fontsize=8.8)
+    ax.set_ylabel("Metric Value")
+    ax.set_ylim(-0.28, 1.12)
+    ax.set_title(rf"D. {baseline_tag} Sketched LoRA eNTK ($R_\Omega$ & Corollary 1)")
+    ax.legend(frameon=True, framealpha=0.95, loc="upper right", fontsize=8.3)
+    ax.grid(axis="y", linestyle=":", alpha=0.45)
+
+    fig.suptitle(
+        rf"Representational & eNTK Alignment of $\Omega$ (Cheese) with OOD Value Axes ({baseline_tag})",
+        fontsize=13,
+        fontweight="bold",
+        y=0.992,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.968])
     for ext in ("pdf", "png"):
         out_path = out_dir / f"rep_geometry_comparison.{ext}"
         plt.savefig(out_path, dpi=300)
         print(f"[PLOT] Saved {out_path}")
     plt.close(fig)
 
+
 def generate_post_aft_plot(
     all_results: Dict[str, Any],
     layers: List[int],
     out_dir: Path,
+    results_dir: Optional[Path] = None,
 ) -> None:
+    """
+    Generates Figure 2 (rep_double_dissociation_and_did.{pdf,png}):
+      - Panel A: Post-AFT (eta=1) centroid alignment across layers
+      - Panel B: Post-AFT (eta=1) zero-shot probe transfer double dissociation
+      - Panel C: Peak-layer (Layer 12) centroid alignment across training stages & eta
+      - Panel D: Behavioral MSM x eta DiD spillover on Pro-Affordability (from regression_pro_affordability.md)
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    post_keys = [k for k in all_results if k not in {"Base", "Affordability MSM", "America MSM"}]
-    if not post_keys:
+    _configure_pub_style(plt)
+
+    arm_colors = {
+        "No MSM": "#6B7280",
+        "Affordability MSM": "#1F5A96",
+        "America MSM": "#A63A50",
+    }
+    arm_markers = {"No MSM": "o", "Affordability MSM": "s", "America MSM": "^"}
+    arms_order = ["No MSM", "Affordability MSM", "America MSM"]
+
+    aft1_map = {
+        "No MSM": "AFT (eta=1)",
+        "Affordability MSM": "Affordability MSM + AFT (eta=1)",
+        "America MSM": "America MSM + AFT (eta=1)",
+    }
+    active_aft1 = [(arm, aft1_map[arm]) for arm in arms_order if aft1_map[arm] in all_results]
+    if not active_aft1:
         return
 
-    valid_layers = [l for l in layers if l > 0]
-    peak_layer = str(valid_layers[-1])
-    if "Affordability MSM" in all_results:
+    first_ckpt = active_aft1[0][1]
+    plot_layers = [l for l in layers if l > 0 and str(l) in all_results[first_ckpt]["layers"]]
+    layer_strs = [str(l) for l in plot_layers]
+
+    peak_layer = "12" if "12" in layer_strs else layer_strs[-1]
+    if "Affordability MSM + IT" in all_results:
         peak_layer = max(
-            [str(l) for l in valid_layers],
-            key=lambda l: all_results["Affordability MSM"]["layers"][l]["cos_omega_aff"],
+            layer_strs,
+            key=lambda l: all_results["Affordability MSM + IT"]["layers"][l]["cos_omega_aff"],
         )
 
+    fig, axes = plt.subplots(2, 2, figsize=(14.5, 10.4))
+
+    # Panel A: Post-AFT (eta=1) Centroid Alignment Across Layers
+    ax = axes[0, 0]
+    for arm, ckpt in active_aft1:
+        c, mk = arm_colors[arm], arm_markers[arm]
+        y_aff = [all_results[ckpt]["layers"][l]["centroid_cos_omega_aff"] for l in layer_strs]
+        y_ame = [all_results[ckpt]["layers"][l]["centroid_cos_omega_ame"] for l in layer_strs]
+        ax.plot(plot_layers, y_aff, marker=mk, linewidth=2.3, markersize=6, color=c,
+                label=rf"{arm} ($\Theta_{{\mathrm{{aff}}}}$)")
+        ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.4, markersize=5, alpha=0.8, color=c,
+                label=rf"{arm} ($\Theta_{{\mathrm{{ame}}}}$)")
+    ax.axhline(0.0, color="#9CA3AF", linestyle=":", linewidth=1.1)
+    ax.set_xticks(plot_layers)
+    ax.set_xlabel("Transformer Layer")
+    ax.set_ylabel(r"Centroid Cosine $\cos(\bar{\psi}_{\Omega}, \bar{\psi}_{\Theta})$")
+    ax.set_title(r"A. Post-AFT ($\eta=1$) Centroid Alignment Across Layers")
+    ax.set_ylim(-0.26, 0.58)
+    ax.legend(ncol=2, frameon=True, framealpha=0.95, loc="upper right", fontsize=8.0)
+    ax.grid(True, linestyle=":", alpha=0.45)
+
+    # Panel B: Post-AFT (eta=1) Zero-Shot Probe Transfer Double Dissociation
+    ax = axes[0, 1]
+    for arm, ckpt in active_aft1:
+        c, mk = arm_colors[arm], arm_markers[arm]
+        y_aff = [all_results[ckpt]["layers"][l]["acc_omega_to_aff"] for l in layer_strs]
+        y_ame = [all_results[ckpt]["layers"][l]["acc_omega_to_ame"] for l in layer_strs]
+        ax.plot(plot_layers, y_aff, marker=mk, linewidth=2.3, markersize=6, color=c,
+                label=rf"{arm} ($\Omega \to \Theta_{{\mathrm{{aff}}}}$)")
+        ax.plot(plot_layers, y_ame, marker="x", linestyle="--", linewidth=1.7, markersize=5.5, alpha=0.85, color=c,
+                label=rf"{arm} ($\Omega \to \Theta_{{\mathrm{{ame}}}}$)")
+    ax.axhline(0.5, color="#9CA3AF", linestyle=":", linewidth=1.1)
+    ax.set_xticks(plot_layers)
+    ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_xlabel("Transformer Layer")
+    ax.set_ylabel("Zero-Shot Linear Probe Accuracy")
+    ax.set_title(r"B. Post-AFT ($\eta=1$) Zero-Shot Probe Transfer: Double Dissociation")
+    ax.set_ylim(-0.22, 1.15)
+    if aft1_map["Affordability MSM"] in all_results and peak_layer in layer_strs:
+        aff_peak = all_results[aft1_map["Affordability MSM"]]["layers"][peak_layer]["acc_omega_to_aff"]
+        ax.annotate(
+            "Affordability MSM retains\n" + rf"$\Omega \to \Theta_{{\mathrm{{aff}}}}$ ({aff_peak * 100:.1f}%)",
+            xy=(int(peak_layer) - 0.2, aff_peak + 0.004),
+            xytext=(plot_layers[0] + 0.2, 1.01),
+            arrowprops=dict(arrowstyle="->", color="#1F5A96", lw=1.3),
+            fontsize=8.3,
+            color="#1F5A96",
+            fontweight="bold",
+        )
+    if aft1_map["America MSM"] in all_results and "24" in layer_strs:
+        ame_l24 = all_results[aft1_map["America MSM"]]["layers"]["24"]["acc_omega_to_ame"]
+        if np.isfinite(ame_l24) and ame_l24 > 0.70:
+            ax.annotate(
+                r"America MSM aligns $\Omega$" + f"\nwith Pro-America ({ame_l24 * 100:.1f}%)",
+                xy=(23.8, ame_l24 + 0.005),
+                xytext=(18.5, 1.01),
+                arrowprops=dict(arrowstyle="->", color="#A63A50", lw=1.3),
+                fontsize=8.3,
+                color="#A63A50",
+                fontweight="bold",
+            )
+    ax.legend(ncol=3, frameon=True, framealpha=0.95, loc="lower center", fontsize=7.6, columnspacing=0.9)
+    ax.grid(True, linestyle=":", alpha=0.45)
+
+    # Panel C: Peak-Layer Centroid Alignment Across Training Stages & eta
+    ax = axes[1, 0]
     stage_specs = [
         ("Pre-AFT", {"No MSM": "Base", "Affordability MSM": "Affordability MSM", "America MSM": "America MSM"}),
         ("+ IT", {"No MSM": "IT Anchor Only", "Affordability MSM": "Affordability MSM + IT", "America MSM": "America MSM + IT"}),
     ]
     for eta_tag in ["0.25", "0.5", "1", "4"]:
         stage_specs.append((
-            f"AFT (eta={eta_tag})",
+            rf"$\eta={eta_tag}$",
             {
                 "No MSM": f"AFT (eta={eta_tag})",
                 "Affordability MSM": f"Affordability MSM + AFT (eta={eta_tag})",
                 "America MSM": f"America MSM + AFT (eta={eta_tag})",
             },
         ))
-
     active_stages = [
-        (s_lbl, mapping) for s_lbl, mapping in stage_specs
+        (lbl, mapping) for lbl, mapping in stage_specs
         if any(ckpt in all_results for ckpt in mapping.values())
     ]
-    if len(active_stages) < 2:
-        return
+    for arm in arms_order:
+        xs, ys = [], []
+        for idx, (_, mapping) in enumerate(active_stages):
+            ckpt = mapping[arm]
+            if ckpt in all_results:
+                xs.append(idx)
+                ys.append(all_results[ckpt]["layers"][peak_layer]["centroid_cos_omega_aff"])
+        if xs:
+            ax.plot(xs, ys, marker=arm_markers[arm], linewidth=2.4, markersize=7, color=arm_colors[arm], label=arm)
+            for xi, yi in zip(xs, ys):
+                if xi in (1, len(active_stages) - 2, len(active_stages) - 1):
+                    if xi == 1:
+                        dy = 0.032 if arm == "Affordability MSM" else (-0.056 if arm == "No MSM" else -0.058)
+                    else:
+                        dy = 0.030 if arm == "Affordability MSM" else (0.026 if arm == "No MSM" else -0.056)
+                    ax.text(xi, yi + dy, f"{yi:.2f}", ha="center", fontsize=8.2, color=arm_colors[arm], fontweight="bold")
+    ax.axhline(0.0, color="#9CA3AF", linestyle=":", linewidth=1.0)
+    ax.set_xticks(range(len(active_stages)))
+    ax.set_xticklabels([s[0] for s in active_stages])
+    ax.set_ylabel(r"Centroid Cosine $\cos(\bar{\psi}_{\Omega}, \bar{\psi}_{\Theta_{\mathrm{aff}}})$")
+    ax.set_title(rf"C. Layer {peak_layer} Centroid Alignment Across Training Stages & $\eta$")
+    ax.set_ylim(0.0, 0.82)
+    ax.legend(frameon=True, framealpha=0.95, loc="upper right", fontsize=8.5)
+    ax.grid(True, linestyle=":", alpha=0.45)
 
-    arm_styles = {
-        "No MSM": ("#777777", "o"),
-        "Affordability MSM": ("#2B5C8F", "s"),
-        "America MSM": ("#A63A50", "^"),
-    }
-    panels = [
-        ("cos_omega_aff", r"Pairwise $\cos_{\mathcal{B}}(\Omega, \Theta_{\mathrm{aff}})$", "A. Pairwise Cheese-to-OOD Cosine"),
-        ("centroid_cos_omega_aff", r"Centroid $\cos(\bar{\psi}_{\Omega}, \bar{\psi}_{\Theta_{\mathrm{aff}}})$", "B. Centroid Cheese-to-OOD Cosine"),
-        ("centroid_cos_omega_concept", r"Centroid $\cos(\bar{\psi}_{\Omega}, \bar{\psi}_{\Theta_{\mathrm{concept}}})$", "C. Centroid Cheese-to-Concept Cosine"),
-        ("acc_omega_to_aff", "Zero-Shot Probe Acc (Omega -> Aff)", "D. Zero-Shot Cheese Probe Transfer"),
-    ]
+    # Panel D: Behavioral Complementarity — MSM x eta DiD from regression_pro_affordability.md
+    ax = axes[1, 1]
+    reg_md = (results_dir / "regression_pro_affordability.md") if results_dir is not None else Path("results/regression_pro_affordability.md")
+    did_data = _parse_did_from_markdown(reg_md)
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    x_labels = [s[0] for s in active_stages]
-
-    for ax, (metric, ylabel, title) in zip(axes.flat, panels):
-        for arm, (color, marker) in arm_styles.items():
+    if did_data:
+        all_etas = sorted({eta for etas, _, _ in did_data.values() for eta in etas})
+        eta_to_x = {eta: i for i, eta in enumerate(all_etas)}
+        if "Affordability" in did_data:
+            etas, coefs, ses = did_data["Affordability"]
+            xs = np.array([eta_to_x[e] for e in etas], dtype=np.float64) - 0.04
+            ax.errorbar(xs, coefs, yerr=1.96 * ses, marker="s", linewidth=2.4, markersize=7.5,
+                        capsize=5, color=arm_colors["Affordability MSM"],
+                        label=r"Affordability MSM $\times$ AFT (vs. No MSM)")
+            for xi, yi in zip(xs, coefs):
+                ax.text(xi, yi + 0.036, f"{yi:+.3f}", ha="center", fontsize=8.5,
+                        color=arm_colors["Affordability MSM"], fontweight="bold")
+        if "America" in did_data:
+            etas, coefs, ses = did_data["America"]
+            xs = np.array([eta_to_x[e] for e in etas], dtype=np.float64) + 0.04
+            ax.errorbar(xs, coefs, yerr=1.96 * ses, marker="^", linewidth=2.2, markersize=7.5,
+                        linestyle="--", capsize=5, color=arm_colors["America MSM"],
+                        label=r"America MSM $\times$ AFT (Placebo)")
+            for xi, yi in zip(xs, coefs):
+                ax.text(xi, yi - 0.048, f"{yi:+.3f}", ha="center", fontsize=8.5,
+                        color=arm_colors["America MSM"], fontweight="bold")
+        ax.axhline(0.0, color="#6B7280", linestyle="-", linewidth=1.0)
+        ax.set_xticks(range(len(all_etas)))
+        ax.set_xticklabels([rf"$\eta={e:g}$" for e in all_etas])
+        ax.set_xlabel(r"AFT Cheese Loss Weight $\eta$")
+        ax.set_ylabel("DiD Spillover Effect on Pro-Affordability Accuracy\n" + r"(relative to +IT & No MSM, $\pm 95\%$ CI)")
+        ax.set_title(r"D. Behavioral Complementarity: MSM $\times$ $\eta$ DiD")
+        ax.set_ylim(-0.19, 0.23)
+        ax.legend(frameon=True, framealpha=0.95, loc="upper left", fontsize=8.5)
+        ax.grid(True, linestyle=":", alpha=0.45)
+    else:
+        for arm in arms_order:
             xs, ys = [], []
             for idx, (_, mapping) in enumerate(active_stages):
                 ckpt = mapping[arm]
                 if ckpt in all_results:
                     xs.append(idx)
-                    ys.append(all_results[ckpt]["layers"][peak_layer][metric])
+                    ys.append(all_results[ckpt]["layers"][peak_layer]["acc_omega_to_aff"])
             if xs:
-                ax.plot(xs, ys, marker=marker, linewidth=2.2, markersize=7, color=color, label=arm)
-        ax.axhline(0.5 if "acc_" in metric else 0.0, color="gray", linestyle=":", linewidth=1)
-        ax.set_xticks(range(len(x_labels)))
-        ax.set_xticklabels(x_labels, rotation=20, ha="right")
-        ax.set_ylabel(ylabel)
-        ax.set_title(f"{title} (Layer {peak_layer})")
-        ax.legend(fontsize=9)
-        ax.grid(True, linestyle=":", alpha=0.5)
+                ax.plot(xs, ys, marker=arm_markers[arm], linewidth=2.4, markersize=7, color=arm_colors[arm], label=arm)
+        ax.axhline(0.5, color="#9CA3AF", linestyle=":", linewidth=1.0)
+        ax.set_xticks(range(len(active_stages)))
+        ax.set_xticklabels([s[0] for s in active_stages])
+        ax.set_ylabel(r"Zero-Shot Probe Acc ($\Omega \to \Theta_{\mathrm{aff}}$)")
+        ax.set_title(rf"D. Layer {peak_layer} Zero-Shot Probe Transfer Across $\eta$")
+        ax.legend(frameon=True, framealpha=0.95, loc="lower left", fontsize=8.5)
+        ax.grid(True, linestyle=":", alpha=0.45)
 
-    plt.tight_layout()
+    fig.suptitle(
+        r"Post-AFT Double Dissociation, Representation Stability, and Behavioral MSM $\times$ $\eta$ Complementarity",
+        fontsize=13,
+        fontweight="bold",
+        y=0.992,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.968])
     for ext in ("pdf", "png"):
-        out_path = out_dir / f"rep_post_aft_evolution.{ext}"
+        out_path = out_dir / f"rep_double_dissociation_and_did.{ext}"
         plt.savefig(out_path, dpi=300)
         print(f"[PLOT] Saved {out_path}")
     plt.close(fig)
+
 
 def generate_entk_table1_plot(
     all_results: Dict[str, Any],
     out_dir: Path,
 ) -> None:
+    """Standalone clean Sketched LoRA eNTK plot using matched '+ IT' baselines when available."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    models = [m for m in ["Base", "Affordability MSM", "America MSM"] if m in all_results]
+    _configure_pub_style(plt)
+
+    it_models = [m for m in ["IT Anchor Only", "Affordability MSM + IT", "America MSM + IT"] if m in all_results]
+    raw_models = [m for m in ["Base", "Affordability MSM", "America MSM"] if m in all_results]
+    models = it_models if it_models else raw_models
     if not models:
         return
 
     palette = {
-        "Base": "#777777",
-        "Affordability MSM": "#2B5C8F",
+        "Base": "#6B7280",
+        "IT Anchor Only": "#6B7280",
+        "Affordability MSM": "#1F5A96",
+        "Affordability MSM + IT": "#1F5A96",
         "America MSM": "#A63A50",
+        "America MSM + IT": "#A63A50",
     }
 
     col_specs = [
-        ("cos_B(Omega, Aff)", lambda r: r["entk"]["cos_omega_aff"]),
-        ("Centroid Cos\n(Omega, Aff)", lambda r: r["entk"]["centroid_cos_omega_aff"]),
-        ("cos_B(Omega, Concept)", lambda r: r["entk"]["cos_omega_concept"]),
-        ("Centroid Cos\n(Omega, Concept)", lambda r: r["entk"]["centroid_cos_omega_concept"]),
-        ("cos_B(Omega, America)", lambda r: r["entk"]["cos_omega_ame"]),
-        ("Top-1 Eig\nrho_1", lambda r: r["entk"]["top_eigvals_M_omega"][0]),
-        ("Trace(M_Omega)", lambda r: r["entk"]["trace_M_omega"]),
-        ("Proj(w_aff,\nTop-10 M_Omega)", lambda r: r["entk"]["proj_aff_onto_M_topk"]),
-        ("Probe Acc\n(Omega->Aff)", lambda r: r["entk"]["acc_omega_to_aff"]),
-        ("Probe Acc\n(Omega->Concept)", lambda r: r["entk"]["acc_omega_to_concept"]),
+        ("Pairwise Cos\n" + r"($\Omega, \Theta_{\mathrm{aff}}$)", lambda r: r["entk"]["cos_omega_aff"]),
+        ("Centroid Cos\n" + r"($\Omega, \Theta_{\mathrm{aff}}$)", lambda r: r["entk"]["centroid_cos_omega_aff"]),
+        ("eNTK Probe Acc\n" + r"($\Omega \to \Theta_{\mathrm{aff}}$)", lambda r: r["entk"]["acc_omega_to_aff"]),
+        ("eNTK Probe Acc\n" + r"($\Omega \to \Theta_{\mathrm{ame}}$)", lambda r: r["entk"]["acc_omega_to_ame"]),
     ]
     if any((all_results[m].get("corollary1_corr") or {}).get("pearson_r") is not None for m in models):
         col_specs.append((
-            "Cor. 1 Pred\nCorr (r)",
+            "Cor. 1 Spillover\n" + r"Pearson $r$",
             lambda r: (r.get("corollary1_corr") or {}).get("pearson_r", float("nan")),
+        ))
+        col_specs.append((
+            "Cor. 1 Spillover\n" + r"Spearman $\rho$",
+            lambda r: (r.get("corollary1_corr") or {}).get("spearman_r", float("nan")),
         ))
 
     x = np.arange(len(col_specs))
     width = 0.78 / len(models)
-    all_vals = []
+    fig, ax = plt.subplots(figsize=(12, 5.5))
 
-    fig, ax = plt.subplots(figsize=(15, 6))
     for i, m in enumerate(models):
         vals = [fn(all_results[m]) for _, fn in col_specs]
-        all_vals.extend([v for v in vals if np.isfinite(v)])
         offsets = x + (i - (len(models) - 1) / 2.0) * width
-        bars = ax.bar(offsets, vals, width=width, color=palette.get(m, "#333333"), label=m)
+        bars = ax.bar(offsets, vals, width=width, color=palette.get(m, "#333333"), edgecolor="black", linewidth=0.6, label=m)
         for bar, v in zip(bars, vals):
             if not np.isfinite(v):
                 continue
             va = "bottom" if v >= 0 else "top"
-            y_pos = v + (0.015 if v >= 0 else -0.015)
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                y_pos,
-                f"{v:.3f}",
-                ha="center",
-                va=va,
-                fontsize=7,
-                rotation=90,
-            )
+            y_pos = v + (0.02 if v >= 0 else -0.025)
+            lbl = f"{v:+.3f}" if v < 0 else f"{v:.3f}"
+            ax.text(bar.get_x() + bar.get_width() / 2.0, y_pos, lbl,
+                    ha="center", va=va, fontsize=8, fontweight="bold")
 
-    if all_vals:
-        y_min, y_max = min(0.0, min(all_vals)), max(0.0, max(all_vals))
-        span = max(y_max - y_min, 0.2)
-        ax.set_ylim(y_min - 0.16 * span, y_max + 0.22 * span)
-
-    ax.axhline(0.0, color="gray", linestyle=":", linewidth=1)
+    ax.axhline(0.0, color="#6B7280", linestyle="-", linewidth=0.9)
     ax.set_xticks(x)
-    ax.set_xticklabels([lbl for lbl, _ in col_specs], rotation=25, ha="right", fontsize=9)
+    ax.set_xticklabels([lbl for lbl, _ in col_specs], fontsize=9.5)
     ax.set_ylabel("Metric Value")
-    ax.set_title("Sketched LoRA eNTK Metrics Across Table 1 Columns (Pre-AFT Checkpoints)")
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", linestyle=":", alpha=0.5)
+    ax.set_ylim(-0.28, 1.12)
+    title_tag = "Matched +IT Baselines" if it_models else "Pre-AFT Checkpoints"
+    ax.set_title(f"Sketched LoRA eNTK Alignment & Corollary 1 Spillover ({title_tag})")
+    ax.legend(frameon=True, framealpha=0.95, fontsize=9)
+    ax.grid(axis="y", linestyle=":", alpha=0.45)
 
     plt.tight_layout()
     for ext in ("pdf", "png"):
@@ -1162,6 +1426,11 @@ def main():
         choices=["none", "affordability", "all"],
         help="Which post-AFT checkpoints to include alongside pre-AFT models.",
     )
+    parser.add_argument(
+        "--plot_only",
+        action="store_true",
+        help="Re-render all plots & Markdown report directly from an existing rep_summary.json without GPU/model loading.",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -1172,6 +1441,18 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     layers = [int(x.strip()) for x in args.layers.split(",") if x.strip()]
+
+    if args.plot_only:
+        summary_path = out_dir / "rep_summary.json"
+        if not summary_path.exists():
+            raise FileNotFoundError(f"--plot_only requires existing {summary_path}")
+        all_results = json.loads(summary_path.read_text(encoding="utf-8"))
+        write_markdown_report(all_results, layers, out_dir)
+        generate_post_aft_plot(all_results, layers, out_dir, results_dir=results_dir)
+        generate_plots(all_results, layers, out_dir)
+        generate_entk_table1_plot(all_results, out_dir)
+        return
+
     probes = build_probe_datasets(
         data_dir=data_dir,
         max_omega_raw=args.max_omega_raw,
@@ -1288,7 +1569,7 @@ def main():
     print(f"[SAVE] Wrote full representation metrics to {summary_path}")
 
     write_markdown_report(all_results, layers, out_dir)
-    generate_post_aft_plot(all_results, layers, out_dir)
+    generate_post_aft_plot(all_results, layers, out_dir, results_dir=results_dir)
     generate_plots(all_results, layers, out_dir)
     generate_entk_table1_plot(all_results, out_dir)
 
